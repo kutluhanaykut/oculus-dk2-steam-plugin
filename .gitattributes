@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+*.png binary
+*.ico binary
+*.dll binary
+*.exe binary
+*.lib binary
+*.pdb binary
+*.zip binary
+*.7z binary
+
+CMakeLists.txt text eol=lf
+*.cmake text eol=lf
