@@ -1,0 +1,25 @@
+{
+  "serialNumber": "DK2VR0001",
+  "driverId": "dk2vr",
+  "name": "dk2vr",
+  "vendor": "Oculus",
+  "resourceOnly": false,
+  "dllPath": "bin/win64/driver_dk2vr.dll",
+  "interfaceVersions": [
+    "IServerTrackedDeviceProvider_004"
+  ],
+  "settings": {
+    "driver_dk2vr": {
+      "model_number": "Oculus Rift DK2",
+      "serial_number": "DK2VR0001"
+    },
+    "dk2vr_display": {
+      "window_x": 1920,
+      "window_y": 0,
+      "window_width": 1920,
+      "window_height": 1080,
+      "render_width": 1920,
+      "render_height": 1080
+    }
+  }
+}

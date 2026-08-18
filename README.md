@@ -145,5 +145,78 @@ Bu hata, DK2'nin USB izleme (tracking) cihazının Windows tarafından doğru s�
 
 > **İpucu:** Uygulama, DK2VRPlayer.log dosyasına detaylı teşhis bilgisi yazar. DK2'nin USB cihazı bulunup bulunmadığını ve hangi sürücüye bağlı olduğunu bu logdan kontrol edebilirsiniz.
 
+## SteamVR Driver (DK2 VR)
+
+Bu proje ayrıca **Oculus DK2** için bir **SteamVR driver** eklentisi içerir. Bu sayede DK2'yi SteamVR uyumlu bir HMD olarak kullanabilir ve SteamVR üzerinden çalışan oyunları 360° VR gözlük içinde deneyimleyebilirsiniz.
+
+### Özellikler
+- **360° VR görüntüleme:** SteamVR uyumlu oyunları DK2 gözlüğü içinde 360° olarak görüntüler.
+- **IMU tabanlı yönelim takibi:** DK2'nin dahili jiroskop/IMU verisiyle başınızı çevirdikçe görüş açısı değişir.
+- **Sabit konum (head tracking olmadan):** Konum kamerası gerekmez. HMD, sabit bir konumda (1.6m yükseklikte) duruyormuş gibi raporlanır. Bu sayede head tracking gerektiren oyunlar bile çalışır.
+- **SteamVR ile tam uyumluluk:** `IServerTrackedDeviceProvider` ve `IVRDisplayComponent` arayüzlerini implement eder.
+
+### SteamVR Driver'ı Derleme
+SteamVR driver'ı ana projeyle birlikte otomatik olarak derlenir:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Configuration Release
+```
+
+Driver çıktısı `build\bin\drivers\dk2vr\` dizininde oluşturulur.
+
+### SteamVR Driver'ı Kurma
+
+**Yöntem 1 — Kurulum EXE'si (önerilen):**
+Derleme sonrası `build\bin\Release\DK2SteamVRDriverInstaller.exe` oluşturulur. Bu EXE:
+1. SteamVR kurulum dizinini otomatik bulur (Steam registry'den).
+2. Derlenmiş driver dosyalarını (`driver_dk2vr.dll` + `driver.vrdrivermanifest`) `SteamVR\drivers\dk2vr\` dizinine kopyalar.
+3. **Kurulum sonrası temel testleri çalıştırır:**
+   - Driver DLL ve manifest'in doğru yere kopyalandığını doğrular.
+   - Manifest'in geçerli olduğunu kontrol eder.
+   - DK2 USB cihazının algılandığını kontrol eder (VID 2833).
+   - DK2'nin WinUSB sürücüsüne bağlı olduğunu kontrol eder.
+   - IMU bağlantısını test eder (rotasyon takibi çalışıyor mu).
+4. Sonuçları konsolda ve bir mesaj kutusunda raporlar.
+
+Çalıştırmak için:
+```powershell
+.\build\bin\Release\DK2SteamVRDriverInstaller.exe
+```
+
+**Yöntem 2 — PowerShell scripti:**
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_steamvr_driver.ps1
+```
+
+Bu script:
+1. SteamVR kurulum dizinini otomatik bulur (Steam registry'den).
+2. Derlenmiş driver dosyalarını `SteamVR\drivers\dk2vr\` dizinine kopyalar.
+3. `driver.vrdrivermanifest` dosyasını da kopyalar.
+
+### SteamVR'da Kullanım
+1. DK2'yi bilgisayara bağlayın (HDMI + USB).
+2. SteamVR'ı başlatın.
+3. SteamVR ayarlarından **Geliştirici** sekmesine gidin.
+4. **DK2 VR Driver**'ı etkinleştirin.
+5. DK2, SteamVR'da bağlı bir HMD olarak görünmelidir.
+6. SteamVR uyumlu bir oyunu başlatın — oyun 360° VR olarak DK2 gözlüğünde görüntülenir.
+
+> **Not:** DK2'nin USB izleme cihazının **WinUSB** veya **libusb-win32** sürücüsüne bağlı olması gerekir. Yukarıdaki "Dahili jiroskop: DK2 BULUNAMADI" bölümündeki adımları izleyin.
+
+### SteamVR Driver Dosyaları
+```
+steamvr_driver/
+├── CMakeLists.txt           # Driver derleme yapılandırması
+├── driver.vrdrivermanifest  # SteamVR driver manifesti
+├── driver_factory.cpp       # HmdDriverFactory export
+├── device_provider.*        # IServerTrackedDeviceProvider implementasyonu
+├── hmd_device_driver.*      # ITrackedDeviceServerDriver + IVRDisplayComponent
+├── dk2_imu.*                # DK2 IMU veri okuyucu (libusb/hidapi)
+├── driverlog.*              # SteamVR log sistemi
+└── vrmath.h                 # Quaternion/matris yardımcıları
+```
+
 ## Açık kaynak lisansları
-Bu proje **MIT** lisansı ile dağıtılmaktadır. Üçüncü parti bileşenler (`libVLC`, `SDL2`, `GLM`, `nlohmann/json`, `OpenHMD`, `hidapi`, `GLEW`, `Dear ImGui`, `yt-dlp`) kendi lisanslarına sahiptir; ayrıntılar `THIRD_PARTY_NOTICES.md` içinde toplanmıştır.
+Bu proje **MIT** lisansı ile dağıtılmaktadır. Üçüncü parti bileşenler (`libVLC`, `SDL2`, `GLM`, `nlohmann/json`, `OpenHMD`, `hidapi`, `GLEW`, `Dear ImGui`, `yt-dlp`, `OpenVR`) kendi lisanslarına sahiptir; ayrıntılar `THIRD_PARTY_NOTICES.md` içinde toplanmıştır.
+
+

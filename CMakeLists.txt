@@ -295,3 +295,17 @@ if(DK2VR_BUILD_TESTS)
     endif()
     add_test(NAME DK2VRCoreTests COMMAND DK2VRCoreTests)
 endif()
+
+# SteamVR driver plugin for the Oculus DK2
+option(DK2VR_BUILD_STEAMVR_DRIVER "Build the SteamVR driver plugin" ON)
+if(DK2VR_BUILD_STEAMVR_DRIVER)
+    add_subdirectory(steamvr_driver)
+endif()
+
+# Standalone installer EXE for the SteamVR driver (installs + runs tests)
+option(DK2VR_BUILD_STEAMVR_INSTALLER "Build the SteamVR driver installer EXE" ON)
+if(DK2VR_BUILD_STEAMVR_INSTALLER)
+    add_subdirectory(installer)
+endif()
+
+
