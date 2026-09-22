@@ -1,27 +1,33 @@
-# Üçüncü Parti Bileşenler
+# Third party notices
 
-Bu belge, `DK2VRPlayer` çalıştırılabilir dosyası içinde veya üzerinde bağımlı
-olunan açık kaynak bileşenlerin lisanslarını özetler. Her madde, ilgili projenin
-resmi kaynağına yönlendirme yapar; kapsamlı metin için kaynak dağıtımlarına
-bakın.
+This project is distributed under the MIT license. It builds against the
+following third party components, each under its own license. None of them are
+redistributed in source form here; the build fetches them.
 
-| Bileşen | Sürüm | Lisans | Kaynak |
-|---------|-------|--------|--------|
-| libVLC (VideoLAN) | 3.0.21 | LGPL-2.1+ | https://download.videolan.org/pub/videolan/vlc/3.0.21/ |
-| yt-dlp | latest | Unlicense (public domain) | https://github.com/yt-dlp/yt-dlp |
-| SDL2 | release-2.30.11 | zlib | https://github.com/libsdl-org/SDL |
-| OpenGL Mathematics (GLM) | 1.0.1 | MIT | https://github.com/g-truc/glm |
-| nlohmann/json | 3.11.3 | MIT | https://github.com/nlohmann/json |
-| GLEW (Perlmint fork) | 2.2.0 | MIT / Khronos | https://github.com/Perlmint/glew-cmake |
-| Dear ImGui | 1.91.6 | MIT | https://github.com/ocornut/imgui |
-| OpenHMD | 0.3.0 | Boost 1.0 | https://github.com/OpenHMD/OpenHMD |
-| hidapi | 0.14.0 | BSD-3-Clause / GPL-2.0 (Windows) | https://github.com/libusb/hidapi |
+## OpenVR SDK
+- Valve Corporation — https://github.com/ValveSoftware/openvr
+- BSD 3-Clause License
+- Only the headers are used. The driver DLL is loaded by `vrserver.exe` and
+  does not link `openvr_api`.
 
-libVLC Windows derlemesi LGPL kapsamında yeniden dağıtılır; `VLC-COPYING.txt`
-taşınabilir pakete dahil edilir. yt-dlp kamu malıdır; herhangi bir kısıtlama
-uygulanmaz.
+## libusb
+- https://github.com/libusb/libusb
+- GNU Lesser General Public License v2.1 or later
+- Used to reach the DK2 tracker through the WinUSB or libusb-win32 driver.
+  Linked statically. Under LGPL-2.1 section 6, the object files needed to
+  relink the driver against a modified libusb are reproducible from this
+  repository: `scripts\build.ps1` fetches the pinned version and rebuilds.
 
-Bu projeyi derlerken, yukarıdaki bileşenler ilk seferde `scripts/bootstrap.ps1`
-üzerinden indirilir ve FetchContent üzerinden yerel kaynak ağacından
-derlenir. Ticari kullanım için lisans koşullarını doğrulamak kullanıcının
-sorumluluğundadır.
+## hidapi
+- https://github.com/libusb/hidapi
+- Tri-licensed: GPL v3, BSD 3-Clause, or the original HIDAPI license
+- Used here under the BSD 3-Clause option, as the fallback transport for DK2
+  units bound to the Windows HID driver.
+
+## Oculus Rift DK2 protocol
+The tracker's report layouts and feature-report handshake follow the
+descriptions in the OpenHMD project (https://github.com/OpenHMD/OpenHMD),
+Boost Software License 1.0. No OpenHMD code is compiled into this project.
+
+"Oculus" and "Rift" are trademarks of their respective owners. This project is
+not affiliated with, endorsed by, or supported by Meta, Oculus VR or Valve.

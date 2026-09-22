@@ -1,62 +1,53 @@
-// DK2 IMU reader for the SteamVR driver.
 #include "dk2_imu.h"
 
 #include "driverlog.h"
 
+#include "core/imu_packet.h"
+
 #include <Windows.h>
-#include <setupapi.h>
-#include <winusb.h>
-#include <usbiodef.h>
-#include <hidsdi.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstring>
-#include <vector>
 
-namespace dk2vr_driver {
+namespace dk2vr {
 namespace {
-
-// {A5DCBF10-6530-11D2-901F-00C04FB951ED} is GUID_DEVINTERFACE_USB_DEVICE
-const GUID kUsbDeviceInterfaceGuid = {
-    0xA5DCBF10, 0x6530, 0x11D2, {0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED}};
 
 constexpr std::uint16_t kOculusVendorId = 0x2833;
 constexpr std::uint16_t kDk2ProductIds[] = {0x0021, 0x2021};
 constexpr std::uint8_t kDk2ImuEndpoint = 0x81;
 
-// Quaternion multiplication: result = a * b
-void quatMultiply(double aw, double ax, double ay, double az,
-                  double bw, double bx, double by, double bz,
-                  double& rw, double& rx, double& ry, double& rz)
+constexpr std::uint64_t kKeepAliveIntervalMs = 3000;
+
+// Class-specific SET_REPORT to the interface.
+constexpr std::uint8_t kSetReportRequestType =
+    static_cast<std::uint8_t>(LIBUSB_REQUEST_TYPE_CLASS)
+    | static_cast<std::uint8_t>(LIBUSB_RECIPIENT_INTERFACE)
+    | static_cast<std::uint8_t>(LIBUSB_ENDPOINT_OUT);
+constexpr std::uint8_t kSetReportRequest = 0x09;
+
+// Feature report 0x02: sensor config. Sets the sample rate divider and the
+// keep-alive interval (0x2710 = 10000 ms) the tracker waits before it stops
+// streaming on its own.
+constexpr std::uint16_t kReportConfig = 0x0302;
+// Feature report 0x08: keep-alive, resets that timer.
+constexpr std::uint16_t kReportKeepAlive = 0x0308;
+// Feature report 0x0C: the DK2's tracking LEDs. The tracker only streams IMU
+// data once this has been sent, even though no camera is in use.
+constexpr std::uint16_t kReportLedControl = 0x020C;
+
+std::uint64_t steadyMilliseconds()
 {
-    rw = aw * bw - ax * bx - ay * by - az * bz;
-    rx = aw * bx + ax * bw + ay * bz - az * by;
-    ry = aw * by - ax * bz + ay * bw + az * bx;
-    rz = aw * bz + ax * by - ay * bx + az * bw;
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
 }
 
-// Quaternion normalization
-void quatNormalize(double& w, double& x, double& y, double& z)
+bool isDk2Product(const std::uint16_t productId)
 {
-    const double n = std::sqrt(w * w + x * x + y * y + z * z);
-    if (n > 0.0) {
-        w /= n;
-        x /= n;
-        y /= n;
-        z /= n;
-    }
-}
-
-// Quaternion conjugate
-void quatConjugate(double w, double x, double y, double z,
-                   double& rw, double& rx, double& ry, double& rz)
-{
-    rw = w;
-    rx = -x;
-    ry = -y;
-    rz = -z;
+    return std::find(std::begin(kDk2ProductIds), std::end(kDk2ProductIds), productId)
+        != std::end(kDk2ProductIds);
 }
 
 } // namespace
@@ -68,26 +59,49 @@ Dk2Imu::~Dk2Imu()
     disconnect();
 }
 
+void Dk2Imu::setGravityGain(const double gain)
+{
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    gravityGain_ = gain;
+    filter_.setGravityGain(gain);
+}
+
 bool Dk2Imu::connect()
 {
     if (connected_) {
         return true;
     }
+    // A previous reader thread may have exited on its own after a transport
+    // error; make sure it is reaped before a new one is started.
+    if (readerThread_.joinable()) {
+        stopRequested_ = true;
+        readerThread_.join();
+    }
+    closeTransports();
+    stopRequested_ = false;
     lastError_.clear();
 
-    // Try libusb first (most reliable for DK2)
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        filter_.reset();
+        filter_.setGravityGain(gravityGain_);
+        haveLastTimestamp_ = false;
+        lastTimestampMicros_ = 0;
+    }
+    packetsReceived_ = 0;
+    packetsRejected_ = 0;
+
     if (connectLibusb()) {
         return true;
     }
-
-    // Fall back to hidapi
     if (connectHidApi()) {
         return true;
     }
 
     if (lastError_.empty()) {
-        lastError_ = "DK2 USB tracking device not found. Make sure the DK2 is connected "
-            "and has the WinUSB or libusb-win32 driver installed.";
+        lastError_ = "DK2 tracker not found. Check the USB cable, and make sure the "
+                     "tracking device is bound to the WinUSB or libusb-win32 driver "
+                     "(Oculus 0.8 runtime, or Zadig).";
     }
     return false;
 }
@@ -96,43 +110,44 @@ bool Dk2Imu::connectLibusb()
 {
     libusb_context* context = nullptr;
     if (libusb_init(&context) != LIBUSB_SUCCESS) {
-        DriverLog("DK2 IMU: libusb_init failed.");
+        lastError_ = "libusb_init failed.";
+        DriverLog("DK2 IMU: %s", lastError_.c_str());
         return false;
     }
 
     libusb_device** deviceList = nullptr;
     const ssize_t deviceCount = libusb_get_device_list(context, &deviceList);
     if (deviceCount < 0) {
-        DriverLog("DK2 IMU: libusb_get_device_list failed.");
+        lastError_ = "libusb_get_device_list failed.";
+        DriverLog("DK2 IMU: %s", lastError_.c_str());
         libusb_exit(context);
         return false;
     }
 
     libusb_device_handle* foundHandle = nullptr;
-    libusb_device* foundDevice = nullptr;
     int foundInterface = -1;
+    bool sawDevice = false;
 
-    for (ssize_t i = 0; i < deviceCount; ++i) {
+    for (ssize_t i = 0; i < deviceCount && foundHandle == nullptr; ++i) {
         libusb_device* device = deviceList[i];
         libusb_device_descriptor descriptor {};
         if (libusb_get_device_descriptor(device, &descriptor) != LIBUSB_SUCCESS) {
             continue;
         }
-        if (descriptor.idVendor != kOculusVendorId) {
+        if (descriptor.idVendor != kOculusVendorId || !isDk2Product(descriptor.idProduct)) {
             continue;
         }
-        const bool productMatch = std::find(std::begin(kDk2ProductIds),
-            std::end(kDk2ProductIds), descriptor.idProduct) != std::end(kDk2ProductIds);
-        if (!productMatch) {
-            continue;
-        }
-
-        DriverLog("DK2 IMU: Found Oculus device VID=0x%04X PID=0x%04X",
+        sawDevice = true;
+        DriverLog("DK2 IMU: found Oculus device VID=0x%04X PID=0x%04X",
             descriptor.idVendor, descriptor.idProduct);
 
         libusb_device_handle* handle = nullptr;
         const int openResult = libusb_open(device, &handle);
         if (openResult != LIBUSB_SUCCESS) {
+            lastError_ = std::string("The DK2 was found but could not be opened (")
+                + libusb_error_name(openResult)
+                + "). The tracking device is probably still bound to the Windows HID "
+                  "driver; switch it to WinUSB with Zadig.";
             DriverLog("DK2 IMU: libusb_open failed, error=%d (%s)",
                 openResult, libusb_error_name(openResult));
             continue;
@@ -141,7 +156,8 @@ bool Dk2Imu::connectLibusb()
         libusb_set_auto_detach_kernel_driver(handle, 1);
 
         libusb_config_descriptor* config = nullptr;
-        if (libusb_get_active_config_descriptor(device, &config) == LIBUSB_SUCCESS && config != nullptr) {
+        if (libusb_get_active_config_descriptor(device, &config) == LIBUSB_SUCCESS
+            && config != nullptr) {
             for (std::uint8_t iface = 0; iface < config->bNumInterfaces; ++iface) {
                 const libusb_interface& interface = config->interface[iface];
                 if (interface.num_altsetting == 0) {
@@ -160,7 +176,6 @@ bool Dk2Imu::connectLibusb()
                 }
                 if (libusb_claim_interface(handle, iface) == LIBUSB_SUCCESS) {
                     foundHandle = handle;
-                    foundDevice = device;
                     foundInterface = static_cast<int>(iface);
                     break;
                 }
@@ -170,15 +185,15 @@ bool Dk2Imu::connectLibusb()
 
         if (foundHandle == nullptr) {
             libusb_close(handle);
-        } else {
-            break;
         }
     }
 
     libusb_free_device_list(deviceList, 1);
 
     if (foundHandle == nullptr) {
-        DriverLog("DK2 IMU: No DK2 device could be opened via libusb.");
+        if (!sawDevice) {
+            DriverLog("DK2 IMU: no Oculus VID 0x2833 device on the bus.");
+        }
         libusb_exit(context);
         return false;
     }
@@ -186,94 +201,78 @@ bool Dk2Imu::connectLibusb()
     libusbHandle_ = foundHandle;
     libusbContext_ = context;
     libusbInterface_ = foundInterface;
-    DriverLog("DK2 IMU: DK2 opened via libusb, interface=%d", foundInterface);
+    // The DK2 contains a USB hub that shares the Oculus vendor id, so the scan
+    // above usually fails to open one device before it reaches the tracker.
+    // Clear that failure now, or status() would keep reporting it.
+    lastError_.clear();
+    DriverLog("DK2 IMU: opened over libusb, interface=%d", foundInterface);
 
-    // Configure the DK2 sensor: set packet interval and keep-alive interval.
-    {
-        std::uint8_t config[7] {0x02, 0x00, 0x00, 0x0C, 0x00, 0x10, 0x27};
-        const int result = libusb_control_transfer(libusbHandle_,
-            static_cast<std::uint8_t>(LIBUSB_REQUEST_TYPE_CLASS)
-                | static_cast<std::uint8_t>(LIBUSB_RECIPIENT_INTERFACE)
-                | static_cast<std::uint8_t>(LIBUSB_ENDPOINT_OUT),
-            0x09, 0x0302, static_cast<std::uint16_t>(libusbInterface_),
-            config, sizeof(config), 1000);
+    const auto sendFeature = [this](const std::uint16_t report, std::uint8_t* payload,
+                                 const std::uint16_t length, const char* what) {
+        const int result = libusb_control_transfer(libusbHandle_, kSetReportRequestType,
+            kSetReportRequest, report, static_cast<std::uint16_t>(libusbInterface_),
+            payload, length, 1000);
         if (result < 0) {
-            DriverLog("DK2 IMU: sensor config failed, error=%d (%s)",
-                result, libusb_error_name(result));
+            DriverLog("DK2 IMU: %s failed, error=%d (%s)", what, result,
+                libusb_error_name(result));
         }
-    }
+        return result >= 0;
+    };
 
-    // Enable the DK2 LEDs (required for IMU data streaming).
-    {
-        std::uint8_t enableLeds[17] {
-            0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x5E, 0x01,
-            0x1A, 0x41, 0x00, 0x00, 0x7F, 0x00, 0x00, 0x00, 0x00};
-        const int result = libusb_control_transfer(libusbHandle_,
-            static_cast<std::uint8_t>(LIBUSB_REQUEST_TYPE_CLASS)
-                | static_cast<std::uint8_t>(LIBUSB_RECIPIENT_INTERFACE)
-                | static_cast<std::uint8_t>(LIBUSB_ENDPOINT_OUT),
-            0x09, 0x020C, static_cast<std::uint16_t>(libusbInterface_),
-            enableLeds, sizeof(enableLeds), 1000);
-        if (result < 0) {
-            DriverLog("DK2 IMU: LED enable failed, error=%d (%s)",
-                result, libusb_error_name(result));
-        }
-    }
+    // Sample rate / keep-alive configuration.
+    std::uint8_t config[7] {0x02, 0x00, 0x00, 0x0C, 0x00, 0x10, 0x27};
+    sendFeature(kReportConfig, config, sizeof(config), "sensor config");
 
+    // Tracking LEDs. Required before the DK2 streams IMU reports.
+    std::uint8_t enableLeds[17] {
+        0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x5E, 0x01,
+        0x1A, 0x41, 0x00, 0x00, 0x7F, 0x00, 0x00, 0x00, 0x00};
+    sendFeature(kReportLedControl, enableLeds, sizeof(enableLeds), "LED enable");
+
+    transport_ = ImuTransport::Libusb;
     connected_ = true;
-    stopRequested_ = false;
     readerThread_ = std::thread(&Dk2Imu::readerLoop, this);
     return true;
 }
 
 bool Dk2Imu::connectHidApi()
 {
-    hid_device_info* devices = hid_enumerate(0, 0);
+    hid_device_info* devices = hid_enumerate(kOculusVendorId, 0);
     if (devices == nullptr) {
-        DriverLog("DK2 IMU: hid_enumerate returned empty.");
+        DriverLog("DK2 IMU: hid_enumerate found no Oculus devices.");
         return false;
     }
 
-    hid_device_info* match = nullptr;
+    hid_device* handle = nullptr;
     for (hid_device_info* current = devices; current != nullptr; current = current->next) {
-        if (current->vendor_id != kOculusVendorId) {
+        if (current->vendor_id != kOculusVendorId || !isDk2Product(current->product_id)) {
             continue;
         }
-        if (std::find(std::begin(kDk2ProductIds), std::end(kDk2ProductIds),
-            current->product_id) == std::end(kDk2ProductIds)) {
-            continue;
+        handle = hid_open_path(current->path);
+        if (handle != nullptr) {
+            break;
         }
-        match = current;
-        break;
+        DriverLog("DK2 IMU: hid_open_path failed for a matching device.");
     }
-
-    if (match == nullptr) {
-        DriverLog("DK2 IMU: No Oculus HID device found.");
-        hid_free_enumeration(devices);
-        return false;
-    }
-
-    hid_device* handle = hid_open_path(match->path);
     hid_free_enumeration(devices);
+
     if (handle == nullptr) {
-        DriverLog("DK2 IMU: hid_open_path failed.");
         return false;
     }
 
     hidHandle_ = handle;
-    DriverLog("DK2 IMU: DK2 opened via hidapi.");
+    // Blocking reads would stall the shutdown path; poll instead.
+    hid_set_nonblocking(hidHandle_, 1);
+    lastError_.clear();
+    DriverLog("DK2 IMU: opened over hidapi.");
+    transport_ = ImuTransport::HidApi;
     connected_ = true;
-    stopRequested_ = false;
     readerThread_ = std::thread(&Dk2Imu::readerLoop, this);
     return true;
 }
 
-void Dk2Imu::disconnect()
+void Dk2Imu::closeTransports()
 {
-    stopRequested_ = true;
-    if (readerThread_.joinable()) {
-        readerThread_.join();
-    }
     if (hidHandle_ != nullptr) {
         hid_close(hidHandle_);
         hidHandle_ = nullptr;
@@ -281,6 +280,7 @@ void Dk2Imu::disconnect()
     if (libusbHandle_ != nullptr) {
         if (libusbInterface_ >= 0) {
             libusb_release_interface(libusbHandle_, libusbInterface_);
+            libusbInterface_ = -1;
         }
         libusb_close(libusbHandle_);
         libusbHandle_ = nullptr;
@@ -289,6 +289,16 @@ void Dk2Imu::disconnect()
         libusb_exit(libusbContext_);
         libusbContext_ = nullptr;
     }
+    transport_ = ImuTransport::None;
+}
+
+void Dk2Imu::disconnect()
+{
+    stopRequested_ = true;
+    if (readerThread_.joinable()) {
+        readerThread_.join();
+    }
+    closeTransports();
     connected_ = false;
 }
 
@@ -297,190 +307,157 @@ bool Dk2Imu::isConnected() const noexcept
     return connected_;
 }
 
-const std::string& Dk2Imu::lastError() const noexcept
+ImuStatus Dk2Imu::status() const
 {
-    return lastError_;
+    ImuStatus result;
+    result.connected = connected_;
+    result.transport = transport_;
+    result.packetsReceived = packetsReceived_;
+    result.packetsRejected = packetsRejected_;
+    result.lastError = lastError_;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        result.gravityLocked = filter_.hasGravityLock();
+    }
+    return result;
 }
 
 void Dk2Imu::recenter()
 {
     std::lock_guard<std::mutex> lock(stateMutex_);
-    // Set calibration to the inverse of the current orientation
-    quatConjugate(orientationW_, orientationX_, orientationY_, orientationZ_,
-                  calibrationW_, calibrationX_, calibrationY_, calibrationZ_);
+    filter_.recenter();
 }
 
-void Dk2Imu::getOrientation(double& w, double& x, double& y, double& z) const
+void Dk2Imu::setYawOffsetDegrees(const double degrees)
 {
     std::lock_guard<std::mutex> lock(stateMutex_);
-    // Apply calibration: result = calibration * orientation
-    quatMultiply(calibrationW_, calibrationX_, calibrationY_, calibrationZ_,
-                 orientationW_, orientationX_, orientationY_, orientationZ_,
-                 w, x, y, z);
-    quatNormalize(w, x, y, z);
+    filter_.setYawOffset(degrees * 3.14159265358979323846 / 180.0);
 }
 
-void Dk2Imu::decodeRiftSample(const std::uint8_t* buffer, std::int32_t out[3])
+double Dk2Imu::yawOffsetDegrees() const
 {
-    const std::int32_t x = (static_cast<std::int32_t>(buffer[0]) << 24)
-        | (static_cast<std::int32_t>(buffer[1]) << 16)
-        | ((static_cast<std::int32_t>(buffer[2]) & 0xF8) << 8);
-    const std::int32_t y = ((static_cast<std::int32_t>(buffer[2]) & 0x07) << 29)
-        | (static_cast<std::int32_t>(buffer[3]) << 21)
-        | (static_cast<std::int32_t>(buffer[4]) << 13)
-        | ((static_cast<std::int32_t>(buffer[5]) & 0xC0) << 5);
-    const std::int32_t z = ((static_cast<std::int32_t>(buffer[5]) & 0x3F) << 26)
-        | (static_cast<std::int32_t>(buffer[6]) << 18)
-        | (static_cast<std::int32_t>(buffer[7]) << 10);
-    out[0] = x >> 11;
-    out[1] = y >> 11;
-    out[2] = z >> 11;
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    return filter_.yawOffset() * 180.0 / 3.14159265358979323846;
 }
 
-void Dk2Imu::parseImuPacket(const std::uint8_t* data, const std::size_t size)
+Quat Dk2Imu::orientation() const
 {
-    // DK2 sends IMU data with report ID 0x01 (DK1 format) or 0x0B (DK2 format).
-    if (size < 26 || (data[0] != 0x01 && data[0] != 0x0B)) {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    return filter_.orientation();
+}
+
+void Dk2Imu::handlePacket(const std::uint8_t* data, const std::size_t size)
+{
+    const ImuPacket packet = parseImuPacket(data, size);
+    if (!packet.valid) {
+        ++packetsRejected_;
         return;
     }
-
-    std::uint8_t numSamples = 0;
-    std::uint64_t timestamp = 0;
-    const std::uint8_t* samplePtr = nullptr;
-
-    if (data[0] == 0x0B) {
-        // DK2 format
-        numSamples = data[3];
-        timestamp = static_cast<std::uint64_t>(data[8])
-            | (static_cast<std::uint64_t>(data[9]) << 8)
-            | (static_cast<std::uint64_t>(data[10]) << 16)
-            | (static_cast<std::uint64_t>(data[11]) << 24);
-        samplePtr = data + 12;
-        if (numSamples > 2) {
-            numSamples = 2;
-        }
-    } else {
-        // DK1 format
-        numSamples = data[1];
-        timestamp = static_cast<std::uint64_t>(data[2])
-            | (static_cast<std::uint64_t>(data[3]) << 8);
-        timestamp *= 1000; // DK1 timestamps are in milliseconds -> microseconds
-        samplePtr = data + 8;
-        if (numSamples > 3) {
-            numSamples = 3;
-        }
-    }
-
-    if (numSamples == 0 || samplePtr == nullptr) {
-        return;
-    }
-
-    // Use the first sample's gyro data for integration.
-    std::int32_t accel[3] {0, 0, 0};
-    std::int32_t gyro[3] {0, 0, 0};
-    decodeRiftSample(samplePtr, accel);
-    decodeRiftSample(samplePtr + 8, gyro);
-
-    // Convert raw values to physical units (radians per second).
-    const double gyroRadPerSec[3] = {
-        static_cast<double>(gyro[0]) * 0.0001,
-        static_cast<double>(gyro[1]) * 0.0001,
-        static_cast<double>(gyro[2]) * 0.0001};
+    ++packetsReceived_;
 
     std::lock_guard<std::mutex> lock(stateMutex_);
 
-    // Integrate gyro angular velocity over time to update orientation.
-    if (haveLastImuTimestamp_ && timestamp > lastImuTimestamp_) {
-        const double dtSeconds = static_cast<double>(timestamp - lastImuTimestamp_) / 1000000.0;
-        if (dtSeconds > 0.0 && dtSeconds < 0.5) {
-            // Convert angular velocity to quaternion delta
-            const double halfAngleX = gyroRadPerSec[0] * dtSeconds * 0.5;
-            const double halfAngleY = gyroRadPerSec[1] * dtSeconds * 0.5;
-            const double halfAngleZ = gyroRadPerSec[2] * dtSeconds * 0.5;
-            const double halfAngleSq = halfAngleX * halfAngleX + halfAngleY * halfAngleY + halfAngleZ * halfAngleZ;
-            double dw, dx, dy, dz;
-            if (halfAngleSq > 0.0) {
-                const double halfAngle = std::sqrt(halfAngleSq);
-                const double s = std::sin(halfAngle) / halfAngle;
-                dw = std::cos(halfAngle);
-                dx = halfAngleX * s;
-                dy = halfAngleY * s;
-                dz = halfAngleZ * s;
-            } else {
-                dw = 1.0;
-                dx = 0.0;
-                dy = 0.0;
-                dz = 0.0;
-            }
+    // The timestamp belongs to the last sample in the report, so the interval
+    // covers all of them. Splitting it evenly integrates every sample instead
+    // of throwing away all but the first.
+    double totalSeconds = 0.0;
+    if (haveLastTimestamp_ && packet.timestampMicros > lastTimestampMicros_) {
+        totalSeconds = static_cast<double>(packet.timestampMicros - lastTimestampMicros_)
+            / 1000000.0;
+    }
+    lastTimestampMicros_ = packet.timestampMicros;
+    haveLastTimestamp_ = true;
 
-            // orientation = orientation * delta
-            double newW, newX, newY, newZ;
-            quatMultiply(orientationW_, orientationX_, orientationY_, orientationZ_,
-                         dw, dx, dy, dz,
-                         newW, newX, newY, newZ);
-            orientationW_ = newW;
-            orientationX_ = newX;
-            orientationY_ = newY;
-            orientationZ_ = newZ;
-            quatNormalize(orientationW_, orientationX_, orientationY_, orientationZ_);
-        }
+    // A wrapped 32-bit counter, a dropped report or a stall all show up as an
+    // implausible interval. Fall back to the nominal 1 kHz sample rate.
+    if (!(totalSeconds > 0.0) || totalSeconds > 0.25) {
+        totalSeconds = kSampleIntervalSeconds * packet.sampleCount;
     }
 
-    lastImuTimestamp_ = timestamp;
-    haveLastImuTimestamp_ = true;
+    const double dtPerSample = totalSeconds / packet.sampleCount;
+
+    for (std::size_t index = 0; index < packet.sampleCount; ++index) {
+        const ImuSample& sample = packet.samples[index];
+        const Vec3 gyro {
+            static_cast<double>(sample.gyro[0]) * kGyroScaleRadPerSecond,
+            static_cast<double>(sample.gyro[1]) * kGyroScaleRadPerSecond,
+            static_cast<double>(sample.gyro[2]) * kGyroScaleRadPerSecond};
+        const Vec3 accel {
+            static_cast<double>(sample.accel[0]) * kAccelScaleMetersPerSecond2,
+            static_cast<double>(sample.accel[1]) * kAccelScaleMetersPerSecond2,
+            static_cast<double>(sample.accel[2]) * kAccelScaleMetersPerSecond2};
+
+        filter_.integrateGyro(gyro, dtPerSample);
+        filter_.applyGravity(accel, dtPerSample);
+    }
 }
 
 void Dk2Imu::readerLoop()
 {
     std::uint8_t buffer[64] {};
+    std::uint64_t lastKeepAliveMs = 0;
+    std::uint64_t lastReportMs = steadyMilliseconds();
+
     while (!stopRequested_) {
-        // Send keep-alive to the DK2 sensor periodically (every 10 seconds).
         if (libusbHandle_ != nullptr) {
-            const auto nowMs = static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count());
-            if (lastKeepAliveMs_ == 0 || (nowMs - lastKeepAliveMs_) >= 10000) {
+            const std::uint64_t nowMs = steadyMilliseconds();
+            if (lastKeepAliveMs == 0 || (nowMs - lastKeepAliveMs) >= kKeepAliveIntervalMs) {
                 std::uint8_t keepAlive[5] {0x08, 0x00, 0x00, 0x10, 0x27};
                 const int result = libusb_control_transfer(libusbHandle_,
-                    static_cast<std::uint8_t>(LIBUSB_REQUEST_TYPE_CLASS)
-                        | static_cast<std::uint8_t>(LIBUSB_RECIPIENT_INTERFACE)
-                        | static_cast<std::uint8_t>(LIBUSB_ENDPOINT_OUT),
-                    0x09, 0x0308, static_cast<std::uint16_t>(libusbInterface_),
+                    kSetReportRequestType, kSetReportRequest, kReportKeepAlive,
+                    static_cast<std::uint16_t>(libusbInterface_),
                     keepAlive, sizeof(keepAlive), 1000);
                 if (result < 0) {
-                    DriverLog("DK2 IMU: keep-alive failed, error=%d", result);
+                    DriverLog("DK2 IMU: keep-alive failed, error=%d (%s)",
+                        result, libusb_error_name(result));
                 }
-                lastKeepAliveMs_ = nowMs;
+                lastKeepAliveMs = nowMs;
             }
-        }
 
-        if (libusbHandle_ != nullptr) {
             int transferred = 0;
             const int result = libusb_interrupt_transfer(libusbHandle_, kDk2ImuEndpoint,
                 buffer, static_cast<int>(sizeof(buffer)), &transferred, 100);
             if (result == LIBUSB_SUCCESS && transferred > 0) {
-                parseImuPacket(buffer, static_cast<std::size_t>(transferred));
+                handlePacket(buffer, static_cast<std::size_t>(transferred));
+                lastReportMs = nowMs;
             } else if (result != LIBUSB_SUCCESS && result != LIBUSB_ERROR_TIMEOUT
                 && result != LIBUSB_ERROR_INTERRUPTED) {
-                DriverLog("DK2 IMU: libusb_interrupt_transfer failed, error=%d (%s)",
-                    result, libusb_error_name(result));
+                lastError_ = std::string("USB transfer failed: ") + libusb_error_name(result);
+                DriverLog("DK2 IMU: %s", lastError_.c_str());
                 break;
             }
         } else if (hidHandle_ != nullptr) {
-            const int bytesRead = hid_read(hidHandle_, buffer, sizeof(buffer));
+            const int bytesRead = hid_read_timeout(hidHandle_, buffer,
+                sizeof(buffer), 100);
             if (bytesRead > 0) {
-                parseImuPacket(buffer, static_cast<std::size_t>(bytesRead));
+                handlePacket(buffer, static_cast<std::size_t>(bytesRead));
+                lastReportMs = steadyMilliseconds();
             } else if (bytesRead < 0) {
-                DriverLog("DK2 IMU: hid_read failed.");
+                lastError_ = "hid_read failed; the DK2 was probably unplugged.";
+                DriverLog("DK2 IMU: %s", lastError_.c_str());
                 break;
             }
         } else {
             break;
         }
 
-        Sleep(1);
+        // Surface a silent tracker once, rather than leaving the user staring
+        // at a frozen view with nothing in the log.
+        const std::uint64_t sinceReport = steadyMilliseconds() - lastReportMs;
+        if (sinceReport > 5000 && packetsReceived_ == 0 && lastError_.empty()) {
+            lastError_ = "The DK2 was opened but is not sending IMU reports. Try "
+                         "unplugging and reconnecting the USB cable.";
+            DriverLog("DK2 IMU: %s", lastError_.c_str());
+        }
     }
-    DriverLog("DK2 IMU: reader loop ended.");
+
+    // Whatever brought us here, the transport is no longer delivering data.
+    // Leaving connected_ set would make the HMD report a frozen orientation
+    // for ever while claiming everything was fine.
+    connected_ = false;
+    DriverLog("DK2 IMU: reader loop ended after %llu packets (%llu rejected).",
+        static_cast<unsigned long long>(packetsReceived_.load()),
+        static_cast<unsigned long long>(packetsRejected_.load()));
 }
 
-} // namespace dk2vr_driver
+} // namespace dk2vr

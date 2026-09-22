@@ -1,6 +1,9 @@
-// DK2 IMU reader for the SteamVR driver.
-// Reads gyroscope data from the Oculus DK2 tracking device and
-// integrates it to produce an orientation quaternion.
+// Reads the Oculus DK2's inertial sensor and maintains a head orientation.
+//
+// The tracker is reached over libusb (WinUSB or libusb-win32 driver) with
+// hidapi as a fallback. Packet decoding and sensor fusion live in core/ so
+// they can be tested without hardware; this class is the transport, the
+// reader thread and the DK2's feature-report handshake.
 #pragma once
 
 #include <atomic>
@@ -12,7 +15,24 @@
 #include <hidapi.h>
 #include <libusb.h>
 
-namespace dk2vr_driver {
+#include "core/orientation_filter.h"
+
+namespace dk2vr {
+
+enum class ImuTransport {
+    None,
+    Libusb,
+    HidApi,
+};
+
+struct ImuStatus {
+    bool connected {false};
+    ImuTransport transport {ImuTransport::None};
+    std::uint64_t packetsReceived {0};
+    std::uint64_t packetsRejected {0};
+    bool gravityLocked {false};
+    std::string lastError;
+};
 
 class Dk2Imu {
 public:
@@ -22,22 +42,30 @@ public:
     Dk2Imu(const Dk2Imu&) = delete;
     Dk2Imu& operator=(const Dk2Imu&) = delete;
 
+    void setGravityGain(double gain);
+
     bool connect();
     void disconnect();
-    bool isConnected() const noexcept;
-    const std::string& lastError() const noexcept;
 
+    bool isConnected() const noexcept;
+    ImuStatus status() const;
+    const std::string& lastError() const noexcept { return lastError_; }
+
+    // Cancels yaw so the user faces forward. Pitch and roll are untouched.
     void recenter();
 
-    // Returns orientation as quaternion (w, x, y, z)
-    void getOrientation(double& w, double& x, double& y, double& z) const;
+    // Manual "forward" correction, in degrees. Survives recentring.
+    void setYawOffsetDegrees(double degrees);
+    double yawOffsetDegrees() const;
+
+    Quat orientation() const;
 
 private:
     bool connectLibusb();
     bool connectHidApi();
+    void closeTransports();
     void readerLoop();
-    void parseImuPacket(const std::uint8_t* data, std::size_t size);
-    static void decodeRiftSample(const std::uint8_t* buffer, std::int32_t out[3]);
+    void handlePacket(const std::uint8_t* data, std::size_t size);
 
     hid_device* hidHandle_ {nullptr};
     libusb_device_handle* libusbHandle_ {nullptr};
@@ -47,21 +75,16 @@ private:
     std::string lastError_;
     std::atomic<bool> connected_ {false};
     std::atomic<bool> stopRequested_ {false};
+    std::atomic<ImuTransport> transport_ {ImuTransport::None};
+    std::atomic<std::uint64_t> packetsReceived_ {0};
+    std::atomic<std::uint64_t> packetsRejected_ {0};
     std::thread readerThread_;
 
     mutable std::mutex stateMutex_;
-    double orientationW_ {1.0};
-    double orientationX_ {0.0};
-    double orientationY_ {0.0};
-    double orientationZ_ {0.0};
-    double calibrationW_ {1.0};
-    double calibrationX_ {0.0};
-    double calibrationY_ {0.0};
-    double calibrationZ_ {0.0};
-
-    std::uint64_t lastImuTimestamp_ {0};
-    bool haveLastImuTimestamp_ {false};
-    std::uint64_t lastKeepAliveMs_ {0};
+    OrientationFilter filter_;
+    double gravityGain_ {1.0};
+    std::uint64_t lastTimestampMicros_ {0};
+    bool haveLastTimestamp_ {false};
 };
 
-} // namespace dk2vr_driver
+} // namespace dk2vr

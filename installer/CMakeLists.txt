@@ -1,18 +1,26 @@
-# CMake configuration for the DK2 SteamVR driver installer EXE.
-# The installer locates SteamVR, copies the driver files into SteamVR's
-# drivers directory, and runs a set of post-install sanity checks.
+# The DK2 SteamVR driver installer EXE.
+#
+# It locates SteamVR, copies the driver in, then runs sanity checks and
+# prints a display report so a misconfigured DK2 can be spotted without
+# digging through the SteamVR logs.
 
-set(DK2VR_INSTALLER_SOURCES
+add_executable(DK2SteamVRDriverInstaller
     main.cpp
     installer.rc
 )
 
-add_executable(DK2SteamVRDriverInstaller ${DK2VR_INSTALLER_SOURCES})
+# The bundled manifest asks for elevation, which the copy into
+# Program Files (x86)/Steam/.../SteamVR/drivers requires.
+target_sources(DK2SteamVRDriverInstaller PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/installer.manifest)
 
-target_include_directories(DK2SteamVRDriverInstaller PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/third_party/openvr/headers
-)
+if(MSVC)
+    # Without this the linker emits its own trustInfo fragment saying
+    # asInvoker, and mt.exe refuses to merge two different levels.
+    target_link_options(DK2SteamVRDriverInstaller PRIVATE /MANIFESTUAC:NO)
+endif()
+
+target_include_directories(DK2SteamVRDriverInstaller PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_compile_definitions(DK2SteamVRDriverInstaller PRIVATE
     NOMINMAX
@@ -21,12 +29,14 @@ target_compile_definitions(DK2SteamVRDriverInstaller PRIVATE
 )
 
 target_link_libraries(DK2SteamVRDriverInstaller PRIVATE
+    dk2vr_core
     libusb_static
-    hidapi::hidapi
+    ${DK2VR_HIDAPI_TARGET}
     setupapi
     winusb
     advapi32
     shell32
+    user32
 )
 
 if(MSVC)

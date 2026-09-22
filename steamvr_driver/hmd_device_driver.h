@@ -1,83 +1,119 @@
-//============ Copyright (c) Valve Corporation, All rights reserved. ============
+// The DK2 as a SteamVR tracked device.
+//
+// Rotation only: there is no positional tracking, so the HMD is reported at a
+// fixed seated height and SteamVR is told the pose will drift in yaw.
 #pragma once
 
-#include <array>
-#include <string>
-#include <memory>
 #include <atomic>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <thread>
 
 #include "openvr_driver.h"
 
-// DK2 display configuration
-struct Dk2DisplayDriverConfiguration
-{
-	int32_t window_x;
-	int32_t window_y;
+#include "core/display_geometry.h"
+#include "core/lens_distortion.h"
+#include "core/orientation_filter.h"
+#include "driver_settings.h"
 
-	int32_t window_width;
-	int32_t window_height;
+namespace dk2vr {
 
-	int32_t render_width;
-	int32_t render_height;
+// Everything the display component needs, resolved once at startup from the
+// settings and from whatever Windows reports about the DK2 panel.
+struct ResolvedDisplay {
+    DisplayLayout layout {};
+    bool autoDetected {false};
+    float refreshHz {75.0F};
+    std::int32_t renderWidth {960};
+    std::int32_t renderHeight {1080};
+    // Per-eye frustum tangents, already widened by the distortion.
+    float tanOuter {1.1F};
+    float tanInner {1.1F};
+    float tanVertical {1.2F};
+    DistortionCoefficients distortion {};
+    bool distortionEnabled {true};
+    float distortionScale {1.0F};
+    float eyeAspect {0.889F};
+    float lensCenterOffset {0.0F};
 };
 
-class Dk2DisplayComponent : public vr::IVRDisplayComponent
-{
-public:
-	explicit Dk2DisplayComponent( const Dk2DisplayDriverConfiguration &config );
+// Resolves the display configuration. Separated from the component so the
+// installer can print the same summary without loading SteamVR.
+ResolvedDisplay resolveDisplay(const DriverSettings& settings,
+    const DisplayInfo& detected);
 
-	// ----- Functions to override vr::IVRDisplayComponent -----
-	bool IsDisplayOnDesktop() override;
-	bool IsDisplayRealDisplay() override;
-	void GetRecommendedRenderTargetSize( uint32_t *pnWidth, uint32_t *pnHeight ) override;
-	void GetEyeOutputViewport( vr::EVREye eEye, uint32_t *pnX, uint32_t *pnY, uint32_t *pnWidth, uint32_t *pnHeight ) override;
-	void GetProjectionRaw( vr::EVREye eEye, float *pfLeft, float *pfRight, float *pfTop, float *pfBottom ) override;
-	vr::DistortionCoordinates_t ComputeDistortion( vr::EVREye eEye, float fU, float fV ) override;
-	void GetWindowBounds( int32_t *pnX, int32_t *pnY, uint32_t *pnWidth, uint32_t *pnHeight ) override;
-	bool ComputeInverseDistortion( vr::HmdVector2_t* pResult, vr::EVREye eEye, uint32_t unChannel, float fU, float fV) override;
+class Dk2DisplayComponent : public vr::IVRDisplayComponent {
+public:
+    explicit Dk2DisplayComponent(const ResolvedDisplay& resolved);
+
+    bool IsDisplayOnDesktop() override;
+    bool IsDisplayRealDisplay() override;
+    void GetRecommendedRenderTargetSize(uint32_t* pnWidth, uint32_t* pnHeight) override;
+    void GetEyeOutputViewport(vr::EVREye eEye, uint32_t* pnX, uint32_t* pnY,
+        uint32_t* pnWidth, uint32_t* pnHeight) override;
+    void GetProjectionRaw(vr::EVREye eEye, float* pfLeft, float* pfRight,
+        float* pfTop, float* pfBottom) override;
+    vr::DistortionCoordinates_t ComputeDistortion(vr::EVREye eEye, float fU, float fV) override;
+    void GetWindowBounds(int32_t* pnX, int32_t* pnY, uint32_t* pnWidth,
+        uint32_t* pnHeight) override;
+    bool ComputeInverseDistortion(vr::HmdVector2_t* pResult, vr::EVREye eEye,
+        uint32_t unChannel, float fU, float fV) override;
 
 private:
-	Dk2DisplayDriverConfiguration config_;
+    ResolvedDisplay resolved_;
 };
 
-//-----------------------------------------------------------------------------
-// Purpose: Represents the DK2 HMD as a tracked device in SteamVR.
-//-----------------------------------------------------------------------------
-class Dk2HmdDeviceDriver : public vr::ITrackedDeviceServerDriver
-{
+class Dk2HmdDeviceDriver : public vr::ITrackedDeviceServerDriver {
 public:
-	Dk2HmdDeviceDriver();
-	vr::EVRInitError Activate( uint32_t unObjectId ) override;
-	void EnterStandby() override;
-	void *GetComponent( const char *pchComponentNameAndVersion ) override;
-	void DebugRequest( const char *pchRequest, char *pchResponseBuffer, uint32_t unResponseBufferSize ) override;
-	vr::DriverPose_t GetPose() override;
-	void Deactivate() override;
+    Dk2HmdDeviceDriver(const DriverSettings& settings, const ResolvedDisplay& resolved);
+    ~Dk2HmdDeviceDriver();
 
-	// ----- Functions we declare ourselves below -----
-	const std::string &MyGetSerialNumber();
-	void MyRunFrame();
-	void MyProcessEvent( const vr::VREvent_t &vrevent );
-	void MyPoseUpdateThread();
+    vr::EVRInitError Activate(uint32_t unObjectId) override;
+    void EnterStandby() override;
+    void* GetComponent(const char* pchComponentNameAndVersion) override;
+    void DebugRequest(const char* pchRequest, char* pchResponseBuffer,
+        uint32_t unResponseBufferSize) override;
+    vr::DriverPose_t GetPose() override;
+    void Deactivate() override;
 
-	// Set the current orientation from the DK2 IMU (quaternion w,x,y,z)
-	void SetOrientation( double w, double x, double y, double z );
+    const std::string& serialNumber() const noexcept { return serialNumber_; }
+
+    // Called from the provider's frame with the latest IMU orientation. The
+    // quaternion is stored under a lock so the pose thread never sees a
+    // half-updated one.
+    void setOrientation(const Quat& orientation);
+
+    // Reported when the tracker is not delivering data, so SteamVR shows the
+    // headset as connected but not tracking rather than silently frozen.
+    void setTrackingValid(bool valid);
+
+    // Keeps SteamVR's proximity sensor reading "worn". The DK2 has no such
+    // sensor, and without one SteamVR decides the headset has been taken off
+    // and drops the display into standby every half minute.
+    void reportUserPresent();
+
+    uint32_t deviceIndex() const noexcept { return deviceIndex_; }
 
 private:
-	std::unique_ptr< Dk2DisplayComponent > my_display_component_;
+    void poseUpdateThread();
 
-	std::string my_hmd_model_number_;
-	std::string my_hmd_serial_number_;
+    DriverSettings settings_;
+    ResolvedDisplay resolved_;
+    std::unique_ptr<Dk2DisplayComponent> displayComponent_;
 
-	std::atomic< bool > is_active_;
-	std::atomic< uint32_t > device_index_;
+    std::string modelNumber_;
+    std::string serialNumber_;
 
-	std::thread my_pose_update_thread_;
+    std::atomic<bool> active_ {false};
+    std::atomic<uint32_t> deviceIndex_ {vr::k_unTrackedDeviceIndexInvalid};
+    std::atomic<bool> trackingValid_ {false};
+    std::thread poseThread_;
 
-	// Current orientation from DK2 IMU
-	std::atomic< double > orientation_w_;
-	std::atomic< double > orientation_x_;
-	std::atomic< double > orientation_y_;
-	std::atomic< double > orientation_z_;
+    mutable std::mutex orientationMutex_;
+    Quat orientation_ {};
+
+    vr::VRInputComponentHandle_t proximity_ {vr::k_ulInvalidInputComponentHandle};
 };
+
+} // namespace dk2vr

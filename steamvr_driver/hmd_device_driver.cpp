@@ -1,452 +1,387 @@
-//============ Copyright (c) Valve Corporation, All rights reserved. ============
 #include "hmd_device_driver.h"
 
 #include "driverlog.h"
-#include "vrmath.h"
-#include <string.h>
 
-// Settings sections
-static const char *dk2_main_settings_section = "driver_dk2vr";
-static const char *dk2_display_settings_section = "dk2vr_display";
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
 
-Dk2HmdDeviceDriver::Dk2HmdDeviceDriver()
+namespace dk2vr {
+namespace {
+
+// Time between the compositor handing a frame to the display and the photons
+// leaving it. The DK2 scans out in about a frame.
+constexpr float kSecondsFromVsyncToPhotons = 0.013F;
+
+} // namespace
+
+ResolvedDisplay resolveDisplay(const DriverSettings& settings, const DisplayInfo& detected)
 {
-	// Keep track of whether Activate() has been called
-	is_active_ = false;
+    ResolvedDisplay resolved;
+    resolved.autoDetected = detected.found;
 
-	// Initialize orientation to identity
-	orientation_w_ = 1.0;
-	orientation_x_ = 0.0;
-	orientation_y_ = 0.0;
-	orientation_z_ = 0.0;
+    LayoutRequest request;
+    if (detected.found) {
+        request.x = detected.x;
+        request.y = detected.y;
+        request.width = detected.width;
+        request.height = detected.height;
+        request.windowsRotationDegrees = detected.windowsRotationDegrees;
+        resolved.refreshHz = detected.refreshHz > 0
+            ? static_cast<float>(detected.refreshHz)
+            : 75.0F;
+    } else {
+        request.x = settings.fallbackWindowX;
+        request.y = settings.fallbackWindowY;
+        request.width = settings.fallbackWindowWidth;
+        request.height = settings.fallbackWindowHeight;
+        resolved.refreshHz = 75.0F;
+    }
+    request.rotationDegrees = settings.imageRotationDegrees;
+    request.splitMode = settings.eyeSplitMode;
+    request.swapEyes = settings.swapEyes;
 
-	// Get model number and serial number from SteamVR settings
-	char model_number[ 1024 ];
-	vr::VRSettings()->GetString( dk2_main_settings_section, "model_number", model_number, sizeof( model_number ) );
-	my_hmd_model_number_ = model_number;
+    resolved.layout = computeLayout(request);
 
-	char serial_number[ 1024 ];
-	vr::VRSettings()->GetString( dk2_main_settings_section, "serial_number", serial_number, sizeof( serial_number ) );
-	my_hmd_serial_number_ = serial_number;
+    if (settings.displayFrequencyOverride > 1.0F) {
+        resolved.refreshHz = settings.displayFrequencyOverride;
+    }
 
-	// SteamVR requires a non-empty serial number for tracked devices. If the
-	// settings value is missing (e.g. manifest defaults not yet applied), fall
-	// back to a stable identifier so the HMD is always registered.
-	if ( my_hmd_serial_number_.empty() )
-	{
-		my_hmd_serial_number_ = "DK2VR0001";
-		DriverLog( "DK2 VR Driver: Serial number empty, using fallback 'DK2VR0001'." );
-	}
+    const float supersample = settings.supersampleScale;
+    resolved.renderWidth = (std::max)(
+        static_cast<std::int32_t>(static_cast<float>(resolved.layout.renderWidth) * supersample),
+        2);
+    resolved.renderHeight = (std::max)(
+        static_cast<std::int32_t>(static_cast<float>(resolved.layout.renderHeight) * supersample),
+        2);
 
-	DriverLog( "DK2 VR Driver: Model Number: %s", my_hmd_model_number_.c_str() );
-	DriverLog( "DK2 VR Driver: Serial Number: %s", my_hmd_serial_number_.c_str() );
+    resolved.distortion = settings.distortion;
+    resolved.distortionEnabled = settings.distortionEnabled;
+    resolved.distortionScale = fitScale(settings.distortion);
+    resolved.lensCenterOffset = dk2vr::lensCenterOffset(settings.screenWidthMeters,
+        settings.lensSeparationMeters);
 
-	// Display settings. The manifest declares defaults, but SteamVR may not
-	// always apply them to steamvr.vrsettings, so fall back to DK2's native
-	// 1920x1080 resolution when the settings are missing (GetInt32 returns 0).
-	Dk2DisplayDriverConfiguration display_configuration{};
-	display_configuration.window_x = vr::VRSettings()->GetInt32( dk2_display_settings_section, "window_x" );
-	display_configuration.window_y = vr::VRSettings()->GetInt32( dk2_display_settings_section, "window_y" );
+    const float halfWidth = settings.screenWidthMeters * 0.5F;
+    const float halfHeight = settings.screenHeightMeters * 0.5F;
+    resolved.eyeAspect = halfHeight > 0.0001F ? halfWidth / halfHeight : 1.0F;
 
-	display_configuration.window_width = vr::VRSettings()->GetInt32( dk2_display_settings_section, "window_width" );
-	if ( display_configuration.window_width <= 0 )
-	{
-		display_configuration.window_width = 1920;
-		DriverLog( "DK2 VR Driver: window_width not set, using default 1920." );
-	}
+    // Frustum tangents from the physical geometry: how far the panel extends
+    // to either side of a lens, over the distance from eye to panel. The
+    // distortion magnifies the view, so the tangents are widened by the same
+    // factor the warp uses.
+    const float relief = settings.eyeReliefMeters > 0.005F ? settings.eyeReliefMeters : 0.041F;
+    const float outerMeters = halfWidth - settings.lensSeparationMeters * 0.5F;
+    const float innerMeters = settings.lensSeparationMeters * 0.5F;
+    // Independent of the distortion toggle, so turning the warp off is a
+    // clean A/B of the warp alone rather than also narrowing the view.
+    const float magnify = settings.fovScale;
 
-	display_configuration.window_height = vr::VRSettings()->GetInt32( dk2_display_settings_section, "window_height" );
-	if ( display_configuration.window_height <= 0 )
-	{
-		display_configuration.window_height = 1080;
-		DriverLog( "DK2 VR Driver: window_height not set, using default 1080." );
-	}
+    resolved.tanOuter = (std::max)(outerMeters, 0.005F) / relief * magnify;
+    resolved.tanInner = (std::max)(innerMeters, 0.005F) / relief * magnify;
+    resolved.tanVertical = halfHeight / relief * magnify;
 
-	display_configuration.render_width = vr::VRSettings()->GetInt32( dk2_display_settings_section, "render_width" );
-	if ( display_configuration.render_width <= 0 )
-	{
-		display_configuration.render_width = 1920;
-		DriverLog( "DK2 VR Driver: render_width not set, using default 1920." );
-	}
-
-	display_configuration.render_height = vr::VRSettings()->GetInt32( dk2_display_settings_section, "render_height" );
-	if ( display_configuration.render_height <= 0 )
-	{
-		display_configuration.render_height = 1080;
-		DriverLog( "DK2 VR Driver: render_height not set, using default 1080." );
-	}
-
-	// Instantiate our display component
-	my_display_component_ = std::make_unique< Dk2DisplayComponent >( display_configuration );
+    return resolved;
 }
 
-//-----------------------------------------------------------------------------
-// Purpose: This is called by vrserver after our
-//  IServerTrackedDeviceProvider calls IVRServerDriverHost::TrackedDeviceAdded.
-//-----------------------------------------------------------------------------
-vr::EVRInitError Dk2HmdDeviceDriver::Activate( uint32_t unObjectId )
-{
-	// Let's keep track of our device index.
-	device_index_ = unObjectId;
+// ---------------------------------------------------------------------------
+// Display component
+// ---------------------------------------------------------------------------
 
-	// Set a member to keep track of whether we've activated yet or not
-	is_active_ = true;
-
-	// Properties are stored in containers, one per device index.
-	vr::PropertyContainerHandle_t container = vr::VRProperties()->TrackedDeviceToPropertyContainer( device_index_ );
-
-	// Set the model number.
-	vr::VRProperties()->SetStringProperty( container, vr::Prop_ModelNumber_String, my_hmd_model_number_.c_str() );
-
-	// Get the IPD of the user from SteamVR settings
-	const float ipd = vr::VRSettings()->GetFloat( vr::k_pch_SteamVR_Section, vr::k_pch_SteamVR_IPD_Float );
-	vr::VRProperties()->SetFloatProperty( container, vr::Prop_UserIpdMeters_Float, ipd );
-
-	// For HMDs, it's required that a refresh rate is set otherwise VRCompositor will fail to start.
-	// DK2 runs at 75Hz.
-	vr::VRProperties()->SetFloatProperty( container, vr::Prop_DisplayFrequency_Float, 75.f );
-
-	// The distance from the user's eyes to the display in meters. This is used for reprojection.
-	vr::VRProperties()->SetFloatProperty( container, vr::Prop_UserHeadToEyeDepthMeters_Float, 0.f );
-
-	// How long from the compositor to submit a frame to the time it takes to display it on the screen.
-	vr::VRProperties()->SetFloatProperty( container, vr::Prop_SecondsFromVsyncToPhotons_Float, 0.11f );
-
-	// The DK2 is used in extended desktop mode, so it IS on the desktop.
-	vr::VRProperties()->SetBoolProperty( container, vr::Prop_IsOnDesktop_Bool, true );
-
-	// Disable debug mode so the compositor renders normally to the HMD.
-	vr::VRProperties()->SetBoolProperty( container, vr::Prop_DisplayDebugMode_Bool, false );
-
-	// Set tracking system name
-	vr::VRProperties()->SetStringProperty( container, vr::Prop_TrackingSystemName_String, "dk2vr" );
-
-	// Set manufacturer name
-	vr::VRProperties()->SetStringProperty( container, vr::Prop_ManufacturerName_String, "Oculus" );
-
-	// Set tracking range
-	vr::VRProperties()->SetInt32Property( container, vr::Prop_TrackingRangeMinimumMeters_Float, 0 );
-	vr::VRProperties()->SetFloatProperty( container, vr::Prop_TrackingRangeMaximumMeters_Float, 0.f );
-
-	// Set whether this HMD has positional tracking
-	vr::VRProperties()->SetBoolProperty( container, vr::Prop_WillDriftInYaw_Bool, true );
-
-	// Start the pose update thread
-	my_pose_update_thread_ = std::thread( &Dk2HmdDeviceDriver::MyPoseUpdateThread, this );
-
-	// We've activated everything successfully!
-	return vr::VRInitError_None;
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: If you're an HMD, this is where you would return an implementation
-// of vr::IVRDisplayComponent, vr::IVRVirtualDisplay or vr::IVRDirectModeComponent.
-//-----------------------------------------------------------------------------
-void *Dk2HmdDeviceDriver::GetComponent( const char *pchComponentNameAndVersion )
-{
-	if ( strcmp( pchComponentNameAndVersion, vr::IVRDisplayComponent_Version ) == 0 )
-	{
-		return my_display_component_.get();
-	}
-
-	return nullptr;
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: This is called by vrserver when a debug request has been made from an application to the driver.
-//-----------------------------------------------------------------------------
-void Dk2HmdDeviceDriver::DebugRequest( const char *pchRequest, char *pchResponseBuffer, uint32_t unResponseBufferSize )
-{
-	if ( unResponseBufferSize >= 1 )
-		pchResponseBuffer[ 0 ] = 0;
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: This is never called by vrserver in recent OpenVR versions,
-// but is useful for giving data to vr::VRServerDriverHost::TrackedDevicePoseUpdated.
-//-----------------------------------------------------------------------------
-vr::DriverPose_t Dk2HmdDeviceDriver::GetPose()
-{
-	// Initialize the struct that we'll be submitting to the runtime.
-	vr::DriverPose_t pose = { 0 };
-
-	// These need to be set to be valid quaternions. The device won't appear otherwise.
-	pose.qWorldFromDriverRotation.w = 1.f;
-	pose.qDriverFromHeadRotation.w = 1.f;
-
-	// Set the orientation from the DK2 IMU
-	pose.qRotation.w = orientation_w_;
-	pose.qRotation.x = orientation_x_;
-	pose.qRotation.y = orientation_y_;
-	pose.qRotation.z = orientation_z_;
-
-	// Static position - the user is standing still (no positional tracking)
-	// Position is at origin, 1.6m above the floor (typical standing height)
-	pose.vecPosition[ 0 ] = 0.0f;
-	pose.vecPosition[ 1 ] = 1.6f;
-	pose.vecPosition[ 2 ] = 0.0f;
-
-	// The pose we provided is valid.
-	pose.poseIsValid = true;
-
-	// Our device is always connected.
-	pose.deviceIsConnected = true;
-
-	// The state of our tracking.
-	pose.result = vr::TrackingResult_Running_OK;
-
-	// For HMDs we want to apply rotation/motion prediction
-	pose.shouldApplyHeadModel = true;
-
-	// We will drift in yaw (no positional tracking, only IMU)
-	pose.willDriftInYaw = true;
-
-	return pose;
-}
-
-void Dk2HmdDeviceDriver::MyPoseUpdateThread()
-{
-	while ( is_active_ )
-	{
-		// Inform the vrserver that our tracked device's pose has updated.
-		vr::VRServerDriverHost()->TrackedDevicePoseUpdated( device_index_, GetPose(), sizeof( vr::DriverPose_t ) );
-
-		// Update our pose every five milliseconds.
-		std::this_thread::sleep_for( std::chrono::milliseconds( 5 ) );
-	}
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: This is called by vrserver when the device should enter standby mode.
-//-----------------------------------------------------------------------------
-void Dk2HmdDeviceDriver::EnterStandby()
-{
-	DriverLog( "DK2 VR Driver: HMD has been put into standby." );
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: This is called by vrserver when the device should deactivate.
-//-----------------------------------------------------------------------------
-void Dk2HmdDeviceDriver::Deactivate()
-{
-	// Join our pose thread
-	if ( is_active_.exchange( false ) )
-	{
-		my_pose_update_thread_.join();
-	}
-
-	// Unassign our device index
-	device_index_ = vr::k_unTrackedDeviceIndexInvalid;
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: This is called by our IServerTrackedDeviceProvider when its RunFrame() method gets called.
-//-----------------------------------------------------------------------------
-void Dk2HmdDeviceDriver::MyRunFrame()
-{
-	// Nothing to do here - pose updates happen in the pose thread
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: This is called by our IServerTrackedDeviceProvider when it pops an event off the event queue.
-//-----------------------------------------------------------------------------
-void Dk2HmdDeviceDriver::MyProcessEvent( const vr::VREvent_t &vrevent )
+Dk2DisplayComponent::Dk2DisplayComponent(const ResolvedDisplay& resolved)
+    : resolved_(resolved)
 {
 }
 
-//-----------------------------------------------------------------------------
-// Purpose: Our IServerTrackedDeviceProvider needs our serial number to add us to vrserver.
-//-----------------------------------------------------------------------------
-const std::string &Dk2HmdDeviceDriver::MyGetSerialNumber()
-{
-	return my_hmd_serial_number_;
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: Set the current orientation from the DK2 IMU.
-//-----------------------------------------------------------------------------
-void Dk2HmdDeviceDriver::SetOrientation( double w, double x, double y, double z )
-{
-	orientation_w_ = w;
-	orientation_x_ = x;
-	orientation_y_ = y;
-	orientation_z_ = z;
-}
-
-//-----------------------------------------------------------------------------
-// DISPLAY DRIVER METHOD DEFINITIONS
-//-----------------------------------------------------------------------------
-
-// Windows display enumeration helpers (for locating the DK2 extended display)
-#include <windows.h>
-
-//-----------------------------------------------------------------------------
-// Purpose: Find the on-screen position of the DK2 display by enumerating the
-// Windows display devices and matching the Oculus Rift DK2 monitor (OVR0003).
-// Returns true if found and fills in x/y. Otherwise returns false.
-//-----------------------------------------------------------------------------
-static bool FindDk2DisplayPosition( int32_t &out_x, int32_t &out_y )
-{
-	DISPLAY_DEVICEW dd{};
-	dd.cb = sizeof( dd );
-
-	for ( DWORD i = 0; EnumDisplayDevicesW( nullptr, i, &dd, 0 ); ++i )
-	{
-		// Look for the attached monitor for this display device
-		DISPLAY_DEVICEW mon{};
-		mon.cb = sizeof( mon );
-		if ( EnumDisplayDevicesW( dd.DeviceName, 0, &mon, 0 ) )
-		{
-			// The DK2 monitor reports as "OVR0003" in its device ID
-			if ( wcsstr( mon.DeviceID, L"OVR0003" ) != nullptr )
-			{
-				// Get the current display settings to find its position
-				DEVMODEW dm{};
-				dm.dmSize = sizeof( dm );
-				if ( EnumDisplaySettingsW( dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm ) )
-				{
-					out_x = dm.dmPosition.x;
-					out_y = dm.dmPosition.y;
-					return true;
-				}
-			}
-		}
-		dd.cb = sizeof( dd );
-	}
-
-	return false;
-}
-
-Dk2DisplayComponent::Dk2DisplayComponent( const Dk2DisplayDriverConfiguration &config )
-	: config_( config )
-{
-	// Auto-detect the DK2's on-screen position so SteamVR renders to the
-	// correct extended display. This overrides the configured window position
-	// when the DK2 monitor is found.
-	int32_t dk2_x = 0, dk2_y = 0;
-	if ( FindDk2DisplayPosition( dk2_x, dk2_y ) )
-	{
-		config_.window_x = dk2_x;
-		config_.window_y = dk2_y;
-		DriverLog( "DK2 VR Driver: DK2 display found at (%d, %d).", dk2_x, dk2_y );
-	}
-	else
-	{
-		DriverLog( "DK2 VR Driver: DK2 display not found, using configured window position (%d, %d).",
-			config_.window_x, config_.window_y );
-	}
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: To inform vrcompositor if this display is considered an on-desktop display.
-//-----------------------------------------------------------------------------
 bool Dk2DisplayComponent::IsDisplayOnDesktop()
 {
-	return true;
+    // The DK2 is an extended desktop monitor, not a direct-mode display.
+    return true;
 }
 
-//-----------------------------------------------------------------------------
-// Purpose: To ask vrcompositor to search for this display.
-// The DK2 is a real physical display (OVR0003) connected via HDMI in extended
-// desktop mode. Returning true tells the compositor to find the display via
-// DXGI and render to it directly, which is required for the compositor to
-// present frames to the HMD. Returning false would make the compositor render
-// to a window, which causes VRInitError_Compositor_InvalidOutputDesktop.
-//-----------------------------------------------------------------------------
 bool Dk2DisplayComponent::IsDisplayRealDisplay()
 {
-	return true;
+    // Tells the compositor to find the panel through DXGI and present to it.
+    // Returning false makes it render into a window instead, which shows up
+    // as VRInitError_Compositor_InvalidOutputDesktop.
+    return true;
 }
 
-//-----------------------------------------------------------------------------
-// Purpose: To inform the rest of the vr system what the recommended target size should be
-//-----------------------------------------------------------------------------
-void Dk2DisplayComponent::GetRecommendedRenderTargetSize( uint32_t *pnWidth, uint32_t *pnHeight )
+void Dk2DisplayComponent::GetRecommendedRenderTargetSize(uint32_t* pnWidth, uint32_t* pnHeight)
 {
-	*pnWidth = config_.render_width;
-	*pnHeight = config_.render_height;
+    *pnWidth = static_cast<uint32_t>(resolved_.renderWidth);
+    *pnHeight = static_cast<uint32_t>(resolved_.renderHeight);
 }
 
-//-----------------------------------------------------------------------------
-// Purpose: To inform vrcompositor how the screens should be organized.
-//-----------------------------------------------------------------------------
-void Dk2DisplayComponent::GetEyeOutputViewport( vr::EVREye eEye, uint32_t *pnX, uint32_t *pnY, uint32_t *pnWidth, uint32_t *pnHeight )
+void Dk2DisplayComponent::GetEyeOutputViewport(const vr::EVREye eEye, uint32_t* pnX,
+    uint32_t* pnY, uint32_t* pnWidth, uint32_t* pnHeight)
 {
-	*pnY = 0;
-
-	// Each eye will have half the window
-	*pnWidth = config_.window_width / 2;
-
-	// Each eye will have the full height
-	*pnHeight = config_.window_height;
-
-	if ( eEye == vr::Eye_Left )
-	{
-		// Left eye viewport on the left half of the window
-		*pnX = 0;
-	}
-	else
-	{
-		// Right eye viewport on the right half of the window
-		*pnX = config_.window_width / 2;
-	}
+    const EyeViewport viewport = eyeViewport(resolved_.layout, eEye == vr::Eye_Left);
+    *pnX = viewport.x;
+    *pnY = viewport.y;
+    *pnWidth = viewport.width;
+    *pnHeight = viewport.height;
 }
 
-//-----------------------------------------------------------------------------
-// Purpose: To inform the compositor what the projection parameters are for this HMD.
-// DK2 has a ~100 degree horizontal FOV.
-//-----------------------------------------------------------------------------
-void Dk2DisplayComponent::GetProjectionRaw( vr::EVREye eEye, float *pfLeft, float *pfRight, float *pfTop, float *pfBottom )
+void Dk2DisplayComponent::GetProjectionRaw(const vr::EVREye eEye, float* pfLeft,
+    float* pfRight, float* pfTop, float* pfBottom)
 {
-	// DK2 projection parameters (approximate)
-	// Horizontal FOV ~100 degrees total, vertical ~90 degrees
-	const float half_fov_h = 0.87f;  // ~50 degrees per eye
-	const float half_fov_v = 0.78f;  // ~45 degrees
-
-	if ( eEye == vr::Eye_Left )
-	{
-		*pfLeft = -half_fov_h;
-		*pfRight = half_fov_h;
-	}
-	else
-	{
-		*pfLeft = -half_fov_h;
-		*pfRight = half_fov_h;
-	}
-	*pfTop = -half_fov_v;
-	*pfBottom = half_fov_v;
+    // The frustum is asymmetric: each lens sits closer to the middle of the
+    // panel than to its outer edge.
+    if (eEye == vr::Eye_Left) {
+        *pfLeft = -resolved_.tanOuter;
+        *pfRight = resolved_.tanInner;
+    } else {
+        *pfLeft = -resolved_.tanInner;
+        *pfRight = resolved_.tanOuter;
+    }
+    *pfTop = -resolved_.tanVertical;
+    *pfBottom = resolved_.tanVertical;
 }
 
-//-----------------------------------------------------------------------------
-// Purpose: To compute the distortion properties for a given uv in an image.
-// DK2 uses barrel distortion. We use identity distortion since SteamVR
-// will handle the lens correction based on the projection parameters.
-//-----------------------------------------------------------------------------
-vr::DistortionCoordinates_t Dk2DisplayComponent::ComputeDistortion( vr::EVREye eEye, float fU, float fV )
+vr::DistortionCoordinates_t Dk2DisplayComponent::ComputeDistortion(const vr::EVREye eEye,
+    const float fU, const float fV)
 {
-	vr::DistortionCoordinates_t coordinates{};
-	coordinates.rfBlue[ 0 ] = fU;
-	coordinates.rfBlue[ 1 ] = fV;
-	coordinates.rfGreen[ 0 ] = fU;
-	coordinates.rfGreen[ 1 ] = fV;
-	coordinates.rfRed[ 0 ] = fU;
-	coordinates.rfRed[ 1 ] = fV;
-	return coordinates;
+    // Undo the panel rotation first, so the distortion is applied in the same
+    // upright frame the eye was rendered in.
+    const Uv rotated = unrotate(resolved_.layout.rotation, Uv {fU, fV});
+
+    vr::DistortionCoordinates_t coordinates {};
+    if (!resolved_.distortionEnabled) {
+        coordinates.rfRed[0] = rotated.u;
+        coordinates.rfRed[1] = rotated.v;
+        coordinates.rfGreen[0] = rotated.u;
+        coordinates.rfGreen[1] = rotated.v;
+        coordinates.rfBlue[0] = rotated.u;
+        coordinates.rfBlue[1] = rotated.v;
+        return coordinates;
+    }
+
+    EyeLensGeometry geometry;
+    geometry.aspect = resolved_.eyeAspect;
+    geometry.lensCenter.v = 0.5F;
+    geometry.lensCenter.u = eEye == vr::Eye_Left
+        ? 0.5F - resolved_.lensCenterOffset
+        : 0.5F + resolved_.lensCenterOffset;
+
+    const DistortionUv output {rotated.u, rotated.v};
+    const DistortionUv red = applyBarrel(resolved_.distortion, geometry, output,
+        ColorChannel::Red, resolved_.distortionScale);
+    const DistortionUv green = applyBarrel(resolved_.distortion, geometry, output,
+        ColorChannel::Green, resolved_.distortionScale);
+    const DistortionUv blue = applyBarrel(resolved_.distortion, geometry, output,
+        ColorChannel::Blue, resolved_.distortionScale);
+
+    coordinates.rfRed[0] = red.u;
+    coordinates.rfRed[1] = red.v;
+    coordinates.rfGreen[0] = green.u;
+    coordinates.rfGreen[1] = green.v;
+    coordinates.rfBlue[0] = blue.u;
+    coordinates.rfBlue[1] = blue.v;
+    return coordinates;
 }
 
-//-----------------------------------------------------------------------------
-// Purpose: To inform vrcompositor what the window bounds for this virtual HMD are.
-//-----------------------------------------------------------------------------
-void Dk2DisplayComponent::GetWindowBounds( int32_t *pnX, int32_t *pnY, uint32_t *pnWidth, uint32_t *pnHeight )
+void Dk2DisplayComponent::GetWindowBounds(int32_t* pnX, int32_t* pnY, uint32_t* pnWidth,
+    uint32_t* pnHeight)
 {
-	*pnX = config_.window_x;
-	*pnY = config_.window_y;
-	*pnWidth = config_.window_width;
-	*pnHeight = config_.window_height;
+    *pnX = resolved_.layout.windowX;
+    *pnY = resolved_.layout.windowY;
+    *pnWidth = static_cast<uint32_t>(resolved_.layout.windowWidth);
+    *pnHeight = static_cast<uint32_t>(resolved_.layout.windowHeight);
 }
 
-bool Dk2DisplayComponent::ComputeInverseDistortion(vr::HmdVector2_t* pResult, vr::EVREye eEye, uint32_t unChannel, float fU, float fV)
+bool Dk2DisplayComponent::ComputeInverseDistortion(vr::HmdVector2_t* /*pResult*/,
+    vr::EVREye /*eEye*/, uint32_t /*unChannel*/, float /*fU*/, float /*fV*/)
 {
-	// Return false to let SteamVR infer an estimate from ComputeDistortion
-	return false;
+    // Returning false lets SteamVR estimate the inverse from ComputeDistortion.
+    return false;
 }
+
+// ---------------------------------------------------------------------------
+// HMD device
+// ---------------------------------------------------------------------------
+
+Dk2HmdDeviceDriver::Dk2HmdDeviceDriver(const DriverSettings& settings,
+    const ResolvedDisplay& resolved)
+    : settings_(settings)
+    , resolved_(resolved)
+    , modelNumber_(settings.modelNumber)
+    , serialNumber_(settings.serialNumber)
+{
+    displayComponent_ = std::make_unique<Dk2DisplayComponent>(resolved_);
+}
+
+Dk2HmdDeviceDriver::~Dk2HmdDeviceDriver()
+{
+    // SteamVR normally calls Deactivate first, but a driver that is torn down
+    // without it would otherwise destroy a running thread and terminate.
+    if (active_.exchange(false) && poseThread_.joinable()) {
+        poseThread_.join();
+    }
+}
+
+vr::EVRInitError Dk2HmdDeviceDriver::Activate(const uint32_t unObjectId)
+{
+    deviceIndex_ = unObjectId;
+    active_ = true;
+
+    const vr::PropertyContainerHandle_t container =
+        vr::VRProperties()->TrackedDeviceToPropertyContainer(unObjectId);
+
+    vr::VRProperties()->SetStringProperty(container, vr::Prop_ModelNumber_String,
+        modelNumber_.c_str());
+    vr::VRProperties()->SetStringProperty(container, vr::Prop_ManufacturerName_String, "Oculus");
+    vr::VRProperties()->SetStringProperty(container, vr::Prop_TrackingSystemName_String, "dk2vr");
+    vr::VRProperties()->SetStringProperty(container, vr::Prop_SerialNumber_String,
+        serialNumber_.c_str());
+
+    const float ipd = vr::VRSettings()->GetFloat(vr::k_pch_SteamVR_Section,
+        vr::k_pch_SteamVR_IPD_Float);
+    vr::VRProperties()->SetFloatProperty(container, vr::Prop_UserIpdMeters_Float,
+        ipd > 0.04F ? ipd : 0.064F);
+
+    // The compositor refuses to start without a refresh rate.
+    vr::VRProperties()->SetFloatProperty(container, vr::Prop_DisplayFrequency_Float,
+        resolved_.refreshHz);
+    vr::VRProperties()->SetFloatProperty(container, vr::Prop_UserHeadToEyeDepthMeters_Float, 0.F);
+    vr::VRProperties()->SetFloatProperty(container,
+        vr::Prop_SecondsFromVsyncToPhotons_Float, kSecondsFromVsyncToPhotons);
+
+    vr::VRProperties()->SetBoolProperty(container, vr::Prop_IsOnDesktop_Bool, true);
+    vr::VRProperties()->SetBoolProperty(container, vr::Prop_DisplayDebugMode_Bool, false);
+
+    // No camera, so there is no positional tracking and yaw has no reference.
+    vr::VRProperties()->SetBoolProperty(container, vr::Prop_WillDriftInYaw_Bool, true);
+    vr::VRProperties()->SetFloatProperty(container,
+        vr::Prop_TrackingRangeMinimumMeters_Float, 0.F);
+    vr::VRProperties()->SetFloatProperty(container,
+        vr::Prop_TrackingRangeMaximumMeters_Float, 0.F);
+
+    // SteamVR watches a proximity sensor to know whether the headset is being
+    // worn. The DK2 has none, so one is declared and held at "worn"; without
+    // it SteamVR parks the display in standby a few seconds in and the view
+    // goes blank.
+    vr::VRProperties()->SetBoolProperty(container, vr::Prop_ContainsProximitySensor_Bool, true);
+    const vr::EVRInputError proximityError =
+        vr::VRDriverInput()->CreateBooleanComponent(container, "/proximity", &proximity_);
+    if (proximityError != vr::VRInputError_None) {
+        DriverLog("DK2 HMD: failed to create /proximity (error %d); SteamVR may drop "
+                  "the display into standby.",
+            static_cast<int>(proximityError));
+    } else {
+        vr::VRDriverInput()->UpdateBooleanComponent(proximity_, true, 0.0);
+    }
+
+    poseThread_ = std::thread(&Dk2HmdDeviceDriver::poseUpdateThread, this);
+
+    DriverLog("DK2 HMD: activated as device %u (serial %s).", unObjectId,
+        serialNumber_.c_str());
+    return vr::VRInitError_None;
+}
+
+void Dk2HmdDeviceDriver::reportUserPresent()
+{
+    if (proximity_ != vr::k_ulInvalidInputComponentHandle) {
+        vr::VRDriverInput()->UpdateBooleanComponent(proximity_, true, 0.0);
+    }
+}
+
+void* Dk2HmdDeviceDriver::GetComponent(const char* pchComponentNameAndVersion)
+{
+    if (std::strcmp(pchComponentNameAndVersion, vr::IVRDisplayComponent_Version) == 0) {
+        return displayComponent_.get();
+    }
+    return nullptr;
+}
+
+void Dk2HmdDeviceDriver::DebugRequest(const char* /*pchRequest*/, char* pchResponseBuffer,
+    const uint32_t unResponseBufferSize)
+{
+    if (unResponseBufferSize >= 1) {
+        pchResponseBuffer[0] = '\0';
+    }
+}
+
+vr::DriverPose_t Dk2HmdDeviceDriver::GetPose()
+{
+    vr::DriverPose_t pose {};
+
+    pose.qWorldFromDriverRotation.w = 1.0;
+    pose.qDriverFromHeadRotation.w = 1.0;
+
+    Quat orientation;
+    {
+        std::lock_guard<std::mutex> lock(orientationMutex_);
+        orientation = orientation_;
+    }
+    pose.qRotation.w = orientation.w;
+    pose.qRotation.x = orientation.x;
+    pose.qRotation.y = orientation.y;
+    pose.qRotation.z = orientation.z;
+
+    // Rotation only: the head stays at a fixed seated height.
+    pose.vecPosition[0] = 0.0;
+    pose.vecPosition[1] = settings_.seatedHeightMeters;
+    pose.vecPosition[2] = 0.0;
+
+    pose.deviceIsConnected = true;
+    const bool tracking = trackingValid_;
+    pose.poseIsValid = tracking;
+    pose.result = tracking ? vr::TrackingResult_Running_OK
+                           : vr::TrackingResult_Running_OutOfRange;
+    pose.shouldApplyHeadModel = true;
+    pose.willDriftInYaw = true;
+
+    return pose;
+}
+
+void Dk2HmdDeviceDriver::setOrientation(const Quat& orientation)
+{
+    std::lock_guard<std::mutex> lock(orientationMutex_);
+    orientation_ = orientation;
+}
+
+void Dk2HmdDeviceDriver::setTrackingValid(const bool valid)
+{
+    trackingValid_ = valid;
+}
+
+void Dk2HmdDeviceDriver::poseUpdateThread()
+{
+    // Pace the updates to the panel rather than to an arbitrary millisecond
+    // count, and use an absolute deadline so the rate does not sag under load.
+    const double refresh = resolved_.refreshHz > 1.0F
+        ? static_cast<double>(resolved_.refreshHz)
+        : 75.0;
+    const auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(1.0 / refresh));
+    auto deadline = std::chrono::steady_clock::now();
+
+    while (active_) {
+        vr::VRServerDriverHost()->TrackedDevicePoseUpdated(deviceIndex_, GetPose(),
+            sizeof(vr::DriverPose_t));
+
+        deadline += interval;
+        const auto now = std::chrono::steady_clock::now();
+        if (deadline < now) {
+            deadline = now;
+        }
+        std::this_thread::sleep_until(deadline);
+    }
+}
+
+void Dk2HmdDeviceDriver::EnterStandby()
+{
+    DriverLog("DK2 HMD: entering standby.");
+}
+
+void Dk2HmdDeviceDriver::Deactivate()
+{
+    if (active_.exchange(false) && poseThread_.joinable()) {
+        poseThread_.join();
+    }
+    deviceIndex_ = vr::k_unTrackedDeviceIndexInvalid;
+    DriverLog("DK2 HMD: deactivated.");
+}
+
+} // namespace dk2vr

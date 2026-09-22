@@ -1,9 +1,12 @@
 {
-  "serialNumber": "DK2VR0001",
-  "driverId": "dk2vr",
+  "alwaysActivate": true,
   "name": "dk2vr",
-  "vendor": "Oculus",
+  "directory": "",
   "resourceOnly": false,
+  "hmd_presence": [
+    "2833:0021",
+    "2833:2021"
+  ],
   "dllPath": "bin/win64/driver_dk2vr.dll",
   "interfaceVersions": [
     "IServerTrackedDeviceProvider_004"
@@ -11,15 +14,49 @@
   "settings": {
     "driver_dk2vr": {
       "model_number": "Oculus Rift DK2",
-      "serial_number": "DK2VR0001"
+      "serial_number": "DK2VR0001",
+      "gravity_gain": 1.0,
+      "seated_height_meters": 1.6,
+      "yaw_offset_degrees": 0.0,
+      "yaw_adjust_speed_degrees_per_second": 45.0
     },
     "dk2vr_display": {
-      "window_x": 1920,
+      "window_x": 0,
       "window_y": 0,
       "window_width": 1920,
       "window_height": 1080,
-      "render_width": 1920,
-      "render_height": 1080
+      "image_rotation": -1,
+      "eye_split": -1,
+      "swap_eyes": false,
+      "supersample": 1.0,
+      "display_frequency": 0.0,
+      "screen_width_meters": 0.12576,
+      "screen_height_meters": 0.07074,
+      "lens_separation_meters": 0.0635,
+      "eye_relief_meters": 0.041,
+      "distortion_enabled": true,
+      "distortion_k0": 1.0,
+      "distortion_k1": 0.22,
+      "distortion_k2": 0.24,
+      "distortion_k3": 0.0,
+      "chromatic_aberration": 0.006,
+      "fov_scale": 1.45
+    },
+    "dk2vr_input": {
+      "controller_enabled": true,
+      "gamepad_enabled": true,
+      "keyboard_enabled": true,
+      "mouse_enabled": true,
+      "controller_distance_meters": 0.35,
+      "controller_pitch_offset_degrees": 0.0,
+      "aim_speed_degrees_per_second": 90.0,
+      "aim_limit_degrees": 60.0,
+      "reach_speed_meters_per_second": 0.6,
+      "min_distance_meters": 0.15,
+      "max_distance_meters": 0.9,
+      "wheel_step_meters": 0.05,
+      "trackpad_requires_modifier": false,
+      "direct_input_mode": false
     }
   }
 }

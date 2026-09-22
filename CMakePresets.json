@@ -8,13 +8,16 @@
   "configurePresets": [
     {
       "name": "windows-x64",
-      "displayName": "Windows x64 / Visual Studio 2026",
-      "generator": "Visual Studio 18 2026",
-      "architecture": "x64",
+      "displayName": "Windows x64",
+      "description": "Uses whichever Visual Studio generator CMake finds, so this works on VS 2022 and later.",
+      "architecture": {
+        "value": "x64",
+        "strategy": "set"
+      },
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "DK2VR_BUILD_TESTS": "ON",
-        "DK2VR_PACKAGE_VLC_PLUGINS": "OFF"
+        "DK2VR_BUILD_INSTALLER": "ON"
       }
     }
   ],

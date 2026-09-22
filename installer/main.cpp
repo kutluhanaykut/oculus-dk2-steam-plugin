@@ -17,6 +17,8 @@
 #include <libusb.h>
 #include <hidapi.h>
 
+#include "core/display_geometry.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
@@ -478,14 +480,14 @@ bool validateManifest(const fs::path& manifestPath, std::string& detail)
         return false;
     }
 
-    // Basic sanity checks: must contain the required keys.
-    const bool hasSerial = content.find("\"serialNumber\"") != std::string::npos;
-    const bool hasDriverId = content.find("\"driverId\"") != std::string::npos;
+    // The fields SteamVR actually needs to load the driver: a name, the path
+    // to the DLL and the interface versions it was built against.
+    const bool hasName = content.find("\"name\"") != std::string::npos;
     const bool hasDllPath = content.find("\"dllPath\"") != std::string::npos;
     const bool hasInterfaces = content.find("\"interfaceVersions\"") != std::string::npos;
 
-    if (!hasSerial || !hasDriverId || !hasDllPath || !hasInterfaces) {
-        detail = "manifest gerekli alanlari icermiyor";
+    if (!hasName || !hasDllPath || !hasInterfaces) {
+        detail = "manifest gerekli alanlari icermiyor (name / dllPath / interfaceVersions)";
         return false;
     }
 
@@ -618,7 +620,55 @@ int runInstaller()
                            : "WinUSB/libusb surucusu gerekli"));
     }
 
-    // 5. Summarize.
+    // Test: the DK2 panel is attached as an extended display. Without this
+    // the compositor has nowhere to present, which is the usual cause of a
+    // SteamVR session that starts but shows nothing in the headset.
+    std::string displayDiagnostics;
+    const dk2vr::DisplayInfo panel = dk2vr::findDk2Display(&displayDiagnostics);
+    {
+        std::string detail;
+        if (panel.found) {
+            detail = std::to_string(panel.width) + "x" + std::to_string(panel.height)
+                + " @ " + std::to_string(panel.refreshHz) + "Hz, konum ("
+                + std::to_string(panel.x) + ", " + std::to_string(panel.y) + ")";
+        } else {
+            detail = "OVR0003 ekrani masaustune bagli degil";
+        }
+        recordTest("DK2 HDMI ekrani algilandi", panel.found, detail);
+    }
+
+    // 5. Display report. Printed whether or not detection succeeded, because
+    // the list of what Windows does see is the fastest way to work out why.
+    std::cout << "\n--------------------------------------------\n";
+    std::cout << "  Ekran raporu\n";
+    std::cout << "--------------------------------------------\n";
+    std::cout << displayDiagnostics;
+
+    if (panel.found) {
+        dk2vr::LayoutRequest request;
+        request.x = panel.x;
+        request.y = panel.y;
+        request.width = panel.width;
+        request.height = panel.height;
+        const dk2vr::DisplayLayout layout = dk2vr::computeLayout(request);
+
+        std::cout << "\nSurucunun kullanacagi yerlesim:\n";
+        std::cout << "  Pencere:     (" << layout.windowX << ", " << layout.windowY
+                  << ") " << layout.windowWidth << "x" << layout.windowHeight << "\n";
+        std::cout << "  Goz duzeni:  " << dk2vr::toString(layout.split) << "\n";
+        std::cout << "  Goruntu donusu: " << dk2vr::toString(layout.rotation)
+                  << " (otomatik secildi)\n";
+        std::cout << "  Goz basina render: " << layout.renderWidth << "x"
+                  << layout.renderHeight << "\n";
+        std::cout << "\nGozlukte goruntu yan dondukse, Steam/config/steamvr.vrsettings\n"
+                     "icindeki \"dk2vr_display\" bolumune \"image_rotation\": 90 (ya da\n"
+                     "180 / 270) ekleyip SteamVR'i yeniden baslatin.\n";
+    } else {
+        std::cout << "\nDK2 ekrani bulunamadi. HDMI kablosunu takin ve Windows ekran\n"
+                     "ayarlarindan DK2'yi 'Genisletilmis' olarak ayarlayin.\n";
+    }
+
+    // 6. Summarize.
     std::cout << "\n--------------------------------------------\n";
     int passed = 0;
     int failed = 0;

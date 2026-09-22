@@ -3,10 +3,9 @@
 /out/
 /dist/
 
-# Downloaded binary SDK/tools
-/third_party/vlc/
-/third_party/yt-dlp.exe
-/third_party/downloads/
+# Locally provided SDK copies. The build fetches OpenVR when this is absent,
+# so checking in Valve's prebuilt binaries is not necessary.
+/third_party/
 
 # IDE and user state
 .vs/
@@ -14,8 +13,6 @@
 *.user
 *.suo
 CMakeUserPresets.json
-imgui.ini
-DK2VRPlayer.log
 
 # OS files
 Thumbs.db
