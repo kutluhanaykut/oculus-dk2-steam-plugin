@@ -88,6 +88,8 @@ DriverSettings loadDriverSettings()
     }
     settings.displayFrequencyOverride = readFloat(kDisplaySection, "display_frequency",
         settings.displayFrequencyOverride);
+    settings.displayIsRealDisplay = readBool(kDisplaySection, "display_is_real",
+        settings.displayIsRealDisplay);
 
     settings.screenWidthMeters = readFloat(kDisplaySection, "screen_width_meters",
         settings.screenWidthMeters);
@@ -188,6 +190,14 @@ std::string describeSettings(const DriverSettings& settings)
         << " k=(" << settings.distortion.k0 << ", " << settings.distortion.k1
         << ", " << settings.distortion.k2 << ", " << settings.distortion.k3 << ")"
         << " chromatic=" << settings.distortion.chromaticAberration << "\n";
+    // Every setting that can change what reaches the panel gets logged. A
+    // setting that is read but never reported turns "did my change take
+    // effect?" into guesswork, which has cost more time here than the bugs.
+    out << "  fov_scale=" << settings.fovScale
+        << "  present=" << (settings.displayIsRealDisplay ? "direct" : "window")
+        << "  eye_relief=" << settings.eyeReliefMeters << "m"
+        << "  screen=" << settings.screenWidthMeters << "x" << settings.screenHeightMeters << "m"
+        << "  lens_sep=" << settings.lensSeparationMeters << "m\n";
     out << "  gravity_gain=" << settings.gravityGain
         << "  seated_height=" << settings.seatedHeightMeters << "m\n";
     out << "  controller=" << (settings.controllerEnabled ? "on" : "off")

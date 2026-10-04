@@ -41,6 +41,18 @@ struct DriverSettings {
     // whatever Windows says the DK2 is running at".
     float displayFrequencyOverride {0.0F};
 
+    // What IVRDisplayComponent::IsDisplayRealDisplay() answers. True asks the
+    // compositor to find the panel through DXGI and present to it directly;
+    // false makes it present into an ordinary window on the extended desktop.
+    //
+    // The direct path is the faster one, but SteamVR identifies the display by
+    // reading its EDID vendor id, and on the DK2 that read times out every
+    // time ("Reading EDID vendor Id timed out" in vrcompositor.txt). When it
+    // then fails to acquire the panel, the headset is left filled with solid
+    // dark red and only a SteamVR restart clears it. Switching this off trades
+    // a little latency for a presentation path that cannot fail that way.
+    bool displayIsRealDisplay {true};
+
     // --- optics ---
     float screenWidthMeters {0.12576F};
     float screenHeightMeters {0.07074F};

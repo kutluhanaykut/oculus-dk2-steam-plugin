@@ -42,6 +42,27 @@ param(
     # text, which the DK2's 960x1080 per eye renders quite coarsely.
     [double]$Supersample,
 
+    # How the compositor presents to the panel. 'direct' uses DXGI, 'window'
+    # presents into a window on the extended desktop. Try 'window' when the
+    # headset fills with solid red and only a SteamVR restart clears it.
+    [ValidateSet('direct', 'window')]
+    [string]$Present,
+
+    # SteamVR's "display locked mode". The compositor normally wants exclusive
+    # fullscreen on the headset's display once a game starts; on an extended
+    # DK2 that transition can fail, leaving the panel solid red while the
+    # dashboard alone still works. Allowing display-locked mode lets it carry
+    # on without that transition.
+    [ValidateSet('on', 'off')]
+    [string]$DisplayLocked,
+
+    # Motion smoothing / async reprojection. It kicks in when a game misses
+    # frames, and on an extended display it needs the same display lock that
+    # fails here. A light game that holds full rate never triggers it, which
+    # is why one game can be fine while another turns the panel red.
+    [ValidateSet('on', 'off')]
+    [string]$MotionSmoothing,
+
     # SteamVR Home. Its tutorial expects real controllers and gets in the way
     # of a gaze pointer, so turning it off drops you straight into the void
     # with the dashboard.
@@ -112,8 +133,9 @@ if ($PSBoundParameters.ContainsKey('K1')) { Set-Value $section 'distortion_k1' $
 if ($PSBoundParameters.ContainsKey('K2')) { Set-Value $section 'distortion_k2' $K2 }
 if ($PSBoundParameters.ContainsKey('FovScale')) { Set-Value $section 'fov_scale' $FovScale }
 if ($PSBoundParameters.ContainsKey('Supersample')) { Set-Value $section 'supersample' $Supersample }
+if ($Present) { Set-Value $section 'display_is_real' ($Present -eq 'direct') }
 
-if ($MirrorView -or $NoMirrorView -or $HomeApp) {
+if ($MirrorView -or $NoMirrorView -or $HomeApp -or $DisplayLocked -or $MotionSmoothing) {
     if ($json.PSObject.Properties.Name -notcontains 'steamvr') {
         $json | Add-Member -MemberType NoteProperty -Name 'steamvr' -Value ([pscustomobject]@{})
     }
@@ -122,6 +144,12 @@ if ($MirrorView -or $NoMirrorView -or $HomeApp) {
     }
     if ($HomeApp) {
         Set-Value $json.steamvr 'enableHomeApp' ($HomeApp -eq 'on')
+    }
+    if ($DisplayLocked) {
+        Set-Value $json.steamvr 'allowDisplayLockedMode' ($DisplayLocked -eq 'on')
+    }
+    if ($MotionSmoothing) {
+        Set-Value $json.steamvr 'motionSmoothing' ($MotionSmoothing -eq 'on')
     }
 }
 
@@ -136,8 +164,11 @@ if ($PSBoundParameters.ContainsKey('K1')) { Write-Host "  distortion_k1  = $($se
 if ($PSBoundParameters.ContainsKey('K2')) { Write-Host "  distortion_k2  = $($section.distortion_k2)" }
 if ($PSBoundParameters.ContainsKey('FovScale')) { Write-Host "  fov_scale      = $($section.fov_scale)" }
 if ($PSBoundParameters.ContainsKey('Supersample')) { Write-Host "  supersample    = $($section.supersample)" }
+if ($Present) { Write-Host "  display_is_real = $($section.display_is_real)  ($Present)" }
 if ($MirrorView -or $NoMirrorView) { Write-Host "  showMirrorView = $($json.steamvr.showMirrorView)" }
 if ($HomeApp) { Write-Host "  enableHomeApp  = $($json.steamvr.enableHomeApp)" }
+if ($DisplayLocked) { Write-Host "  allowDisplayLockedMode = $($json.steamvr.allowDisplayLockedMode)" }
+if ($MotionSmoothing) { Write-Host "  motionSmoothing = $($json.steamvr.motionSmoothing)" }
 Write-Host ''
 Write-Host 'Now start SteamVR and look through the headset.' -ForegroundColor Cyan
 Write-Host "Backup of the previous file: $config.dk2backup"

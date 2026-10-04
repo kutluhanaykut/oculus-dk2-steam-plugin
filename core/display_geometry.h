@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace dk2vr {
 
@@ -140,6 +141,20 @@ EyeViewport eyeViewport(const DisplayLayout& layout, bool isLeftEye);
 // filled with a human readable dump of every display considered, which is
 // what the driver writes to its log when detection fails.
 DisplayInfo findDk2Display(std::string* diagnostics);
+
+// One mode the panel advertises.
+struct DisplayMode {
+    std::int32_t width {0};
+    std::int32_t height {0};
+    std::int32_t refreshHz {0};
+    std::int32_t bitsPerPixel {0};
+};
+
+// Every mode Windows lists for a display device, newest-first order as
+// reported. SteamVR has to put the compositor into fullscreen on the panel,
+// and that only works for a mode the output actually advertises, so knowing
+// the list is the difference between guessing and knowing.
+std::vector<DisplayMode> enumerateDisplayModes(const std::wstring& deviceName);
 
 // Human readable names, used in log output.
 const char* toString(ImageRotation rotation);

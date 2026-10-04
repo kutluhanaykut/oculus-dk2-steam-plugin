@@ -56,6 +56,7 @@ ResolvedDisplay resolveDisplay(const DriverSettings& settings, const DisplayInfo
         static_cast<std::int32_t>(static_cast<float>(resolved.layout.renderHeight) * supersample),
         2);
 
+    resolved.isRealDisplay = settings.displayIsRealDisplay;
     resolved.distortion = settings.distortion;
     resolved.distortionEnabled = settings.distortionEnabled;
     resolved.distortionScale = fitScale(settings.distortion);
@@ -101,10 +102,13 @@ bool Dk2DisplayComponent::IsDisplayOnDesktop()
 
 bool Dk2DisplayComponent::IsDisplayRealDisplay()
 {
-    // Tells the compositor to find the panel through DXGI and present to it.
-    // Returning false makes it render into a window instead, which shows up
-    // as VRInitError_Compositor_InvalidOutputDesktop.
-    return true;
+    // True asks the compositor to find the panel through DXGI and present to
+    // it directly; false makes it present into a window on the extended
+    // desktop instead. Configurable because the direct path depends on
+    // reading the panel's EDID vendor id, which times out on the DK2, and a
+    // failed acquisition leaves the headset filled with solid dark red until
+    // SteamVR is restarted.
+    return resolved_.isRealDisplay;
 }
 
 void Dk2DisplayComponent::GetRecommendedRenderTargetSize(uint32_t* pnWidth, uint32_t* pnHeight)

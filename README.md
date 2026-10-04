@@ -136,6 +136,36 @@ Oyun "use your wand to move forward" gibi bir uyarı veriyorsa aradığı şey b
 
 Gamepad varsa çok daha rahat: sol çubuk touchpad eksenlerini, çubuğa basmak da tıklamayı verir.
 
+## Önemli: DK2 ekranına pencere koymayın
+
+Bu kurulumun en kritik çalıştırma koşulu, ve ihlal edildiğinde hiçbir log dosyasına yazılmıyor:
+
+> **DK2'nin ekranında hiçbir pencere bulunmamalı.** Ne oyunun kendi penceresi, ne SteamVR'ın ayna görünümü, ne gezgin, hiçbiri. O ekran yalnızca kompozitörün olmalı.
+
+DK2 genişletilmiş masaüstü ekranı olduğu için SteamVR kompozitörü onu tam ekran olarak sahiplenmek zorunda. Orada başka bir pencere varsa bunu yapamaz ve gözlük **düz koyu kırmızıyla** (#8B0000) dolar — ya da üstteki pencerenin arka planını görürsünüz.
+
+Belirtiler ve neden yanıltıcı olduğu:
+
+- SteamVR durum penceresinde `Headset Error — Make sure your headset's display is in fullscreen mode (-202)` yazar
+- O penceredeki **"Enable fullscreen mode"** bağlantısı işe yaramaz, çünkü engel duran pencere hâlâ oradadır
+- `vrserver.txt` ve `vrcompositor.txt` **tertemizdir**; kırmızı ve çalışan açılışların logları birbirinin aynısıdır
+- Oyun kusursuz çalışıyor görünür: kompozitör istatistiğinde binlerce `presents`, `0 dropped`
+
+Pratikte en sık sebebi **pencereli modda açılan bir oyunun penceresinin DK2 ekranına düşmesi.** Oyunu açın, penceresini bir kez ana monitöre sürükleyin; konumu hatırlanır.
+
+Ekran bir kez kaybedildiğinde kendiliğinden geri alınmaz — engeli kaldırdıktan sonra SteamVR'ı yeniden başlatın.
+
+### Hızlı teşhis
+
+Masaüstünden DK2 ekranının bulunduğu bölgeyi yakalayıp piksel **standart sapmasına** bakın:
+
+| sapma | anlamı |
+|---|---|
+| ~0 | düz dolgu — kompozitör ekranı alamamış, ya da bir pencere kaplıyor |
+| > 25 | gerçek oyun görüntüsü, her şey yolunda |
+
+Ortalama renk de ayırt eder: `R` yüksek, `G` ve `B` sıfıra yakınsa kompozitörün kırmızı hata dolgusudur.
+
 ## Sorun giderme
 
 ### Önce teşhis aracını çalıştırın
@@ -182,19 +212,36 @@ Alternatif bir yaklaşım: Windows ekran ayarlarından DK2'nin yönünü, teşhi
 
 ### Gözlükte tek renk kırmızı ekran
 
-İki bilinen sebebi var, ikisi de logdan ayırt edilir.
+**Önce SteamVR'ın durum penceresine bakın.** Büyük ihtimalle şu yazıyordur:
 
-**1. Çözünürlük çarpanı fazla.** `supersample` değerini SteamVR kendi render ölçeğiyle bir kez daha çarpar, yani asıl ayrılan doku göründüğünden çok daha büyük olur. DK2'de **1.4'ün üstünde** kompozitör sessizce pes edip paneli kırmızıya boyuyor — logda hata yazmıyor. Ölçtüğümüz eşik: 1.25 ve 1.4 sorunsuz, 1.6 kırmızı.
+> **Headset Error** — Make sure your headset's display is in fullscreen mode.
+> **Enable fullscreen mode** (-202)
+
+Bu bağlantıya tıklayın, kırmızı anında geçer.
+
+Sebebi: DK2 genişletilmiş masaüstü ekranı olduğu için kompozitörün o ekranda **tam ekrana geçmesi** gerekiyor. Geçemediğinde paneli düz koyu kırmızıyla (#8B0000) dolduruyor. Geçiş bazen kendiliğinden tutuyor, bazen tutmuyor — bu yüzden sorun aralıklı görünüyor ve SteamVR'ı yeniden başlatmak bazen düzeltiyor.
+
+> Bu hata **hiçbir log dosyasına yazılmıyor** — ne `vrserver.txt`'ye ne `vrcompositor.txt`'ye. Kırmızı ve çalışan açılışların kompozitör logları birbirinin aynısı. Uyarı sadece SteamVR durum penceresinde duruyor. Kırmızı ekranı loglardan teşhis etmeye çalışmayın, pencereye bakın.
+
+Tıklamak işe yaramazsa veya pencere görünmüyorsa:
+
+1. SteamVR'ı tamamen kapatıp açın
+2. Windows'ta DK2'nin hâlâ genişletilmiş ekran olduğunu doğrulayın (`DK2DisplayReport.exe`)
+3. `supersample` değerini kontrol edin — 1.4 üstü ayrı bir kırmızı ekran sebebidir (aşağıya bakın)
+
+### Çözünürlük çarpanından kaynaklanan kırmızı
+
+`supersample` değerini SteamVR kendi render ölçeğiyle bir kez daha çarpar, yani asıl ayrılan doku göründüğünden büyük olur. DK2'de **1.4'ün üstünde** kompozitör sessizce pes ediyor. Ölçtüğümüz eşik: 1.25 ve 1.4 sorunsuz, 1.6 kırmızı.
 
 ```bash
 powershell -ExecutionPolicy Bypass -File scripts\set_rotation.ps1 auto -Supersample 1.4
 ```
 
-Sürücü 1.4'ün üstündeki değerlerde loga uyarı yazar. Daha fazla netlik istiyorsanız `supersample` yerine SteamVR'ın kendi *Ayarlar → Video → Render Çözünürlüğü* kaydırıcısını kullanın.
+Sürücü 1.4 üstündeki değerlerde loga uyarı yazar. Netlik için `supersample` yerine SteamVR'ın kendi *Ayarlar → Video → Render Çözünürlüğü* kaydırıcısı tercih edilmeli; onun kendi kırpması bu hatayı önlüyor.
 
-**2. HMD standby'a giriyor.** Logda `entering standby` / `leaving standby` satırları birkaç saniyede bir tekrarlıyorsa, SteamVR gözlüğün çıkarıldığını sanıyordur. Sürücü `/proximity` bileşenini bildirdiği için bu artık olmamalı; oluyorsa logda `failed to create /proximity` satırını arayın.
+### HMD standby'a giriyor
 
-Ayrımı hızlıca yapmak için: masaüstünden DK2 ekranının bulunduğu bölgeyi yakalayın. Düz kırmızı çıkıyorsa kompozitör özel tam ekrana geçememiş demektir; kapkara çıkıyorsa aslında her şey yolunda ve görüntü gözlüğe gidiyordur.
+Logda `entering standby` / `leaving standby` satırları birkaç saniyede bir tekrarlıyorsa SteamVR gözlüğün çıkarıldığını sanıyordur. Sürücü `/proximity` bileşenini bildirdiği için bu olmamalı; oluyorsa logda `failed to create /proximity` satırını arayın.
 
 ### "Tracker not connected" / baş hareketi çalışmıyor
 

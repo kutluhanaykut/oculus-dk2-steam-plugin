@@ -3,9 +3,10 @@
   "name": "dk2vr",
   "directory": "",
   "resourceOnly": false,
+  "_comment_hmd_presence": "VID.PID, separated by a dot. A colon does not parse, and SteamVR only says so in vrcompositor.txt.",
   "hmd_presence": [
-    "2833:0021",
-    "2833:2021"
+    "2833.0021",
+    "2833.2021"
   ],
   "dllPath": "bin/win64/driver_dk2vr.dll",
   "interfaceVersions": [
@@ -30,6 +31,7 @@
       "swap_eyes": false,
       "supersample": 1.0,
       "display_frequency": 0.0,
+      "display_is_real": true,
       "screen_width_meters": 0.12576,
       "screen_height_meters": 0.07074,
       "lens_separation_meters": 0.0635,

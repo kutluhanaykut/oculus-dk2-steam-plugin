@@ -36,6 +36,7 @@ struct ResolvedDisplay {
     float distortionScale {1.0F};
     float eyeAspect {0.889F};
     float lensCenterOffset {0.0F};
+    bool isRealDisplay {true};
 };
 
 // Resolves the display configuration. Separated from the component so the

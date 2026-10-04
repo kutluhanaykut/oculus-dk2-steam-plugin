@@ -233,6 +233,34 @@ DisplayInfo findDk2Display(std::string* diagnostics)
     return result;
 }
 
+std::vector<DisplayMode> enumerateDisplayModes(const std::wstring& deviceName)
+{
+    std::vector<DisplayMode> modes;
+    DEVMODEW mode {};
+    mode.dmSize = sizeof(mode);
+    for (DWORD index = 0; EnumDisplaySettingsW(deviceName.c_str(), index, &mode); ++index) {
+        DisplayMode entry;
+        entry.width = static_cast<std::int32_t>(mode.dmPelsWidth);
+        entry.height = static_cast<std::int32_t>(mode.dmPelsHeight);
+        entry.refreshHz = static_cast<std::int32_t>(mode.dmDisplayFrequency);
+        entry.bitsPerPixel = static_cast<std::int32_t>(mode.dmBitsPerPel);
+
+        // The list repeats every mode once per colour depth and per rotation;
+        // only distinct geometry matters here.
+        const bool seen = std::any_of(modes.begin(), modes.end(),
+            [&entry](const DisplayMode& other) {
+                return other.width == entry.width && other.height == entry.height
+                    && other.refreshHz == entry.refreshHz;
+            });
+        if (!seen) {
+            modes.push_back(entry);
+        }
+        mode = {};
+        mode.dmSize = sizeof(mode);
+    }
+    return modes;
+}
+
 const char* toString(const ImageRotation rotation)
 {
     switch (rotation) {

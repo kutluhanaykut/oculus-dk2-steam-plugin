@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #include "core/display_geometry.h"
 
@@ -53,13 +54,36 @@ int main()
     std::printf("  rotation    %d degrees, applied by Windows\n\n",
         info.windowsRotationDegrees);
 
-    if (info.windowsRotationDegrees != 0) {
-        std::printf("Windows is rotating this panel, so its raw scanout is %dx%d and\n",
-            info.height, info.width);
-        std::printf("the desktop you see is turned to fit. SteamVR presents through\n");
-        std::printf("DXGI and skips that step, so the driver repeats the turn itself.\n");
-        std::printf("That is what the automatic choice below reflects.\n\n");
+    const std::vector<dk2vr::DisplayMode> modes =
+        dk2vr::enumerateDisplayModes(info.deviceName);
+    std::printf("Modes this panel advertises (%d distinct):\n",
+        static_cast<int>(modes.size()));
+    bool currentIsAdvertised = false;
+    for (const dk2vr::DisplayMode& mode : modes) {
+        const bool current = mode.width == info.width && mode.height == info.height
+            && mode.refreshHz == info.refreshHz;
+        currentIsAdvertised = currentIsAdvertised || current;
+        std::printf("  %5dx%-5d %3d Hz%s\n", mode.width, mode.height, mode.refreshHz,
+            current ? "   <-- in use" : "");
     }
+
+    std::printf("\nSteamVR has to put its compositor into fullscreen on this panel.\n");
+    std::printf("That only works for a mode the output really advertises; when it\n");
+    std::printf("fails, the headset is left filled with solid dark red and SteamVR\n");
+    std::printf("offers an \"Enable fullscreen mode\" link in its status window.\n");
+    if (!currentIsAdvertised) {
+        std::printf("\n  WARNING: the mode in use is not in the advertised list above.\n");
+    }
+    if (info.windowsRotationDegrees != 0) {
+        std::printf("\n  NOTE: Windows is rotating this panel by %d degrees, so its raw\n",
+            info.windowsRotationDegrees);
+        std::printf("  scanout is %dx%d. A rotated output is a common reason for the\n",
+            info.height, info.width);
+        std::printf("  fullscreen transition to fail. Setting the DK2's orientation in\n");
+        std::printf("  Windows so this reads 0 degrees is worth trying; the driver\n");
+        std::printf("  handles the resulting portrait framebuffer on its own.\n");
+    }
+    std::printf("\n");
 
     dk2vr::LayoutRequest request;
     request.x = info.x;
@@ -71,7 +95,7 @@ int main()
     std::printf("Layout the driver would use:\n");
     printLayout("auto", request);
 
-    std::printf("\nIf the view is turned on its side, add one of these to the\n");
+    std::printf("\nIf the view is turned on its side, set one of these in the\n");
     std::printf("dk2vr_display section of Steam\\config\\steamvr.vrsettings:\n\n");
     for (const int degrees : {0, 90, 180, 270}) {
         dk2vr::LayoutRequest option = request;
