@@ -9,12 +9,16 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 
 namespace dk2vr {
 namespace {
 
 constexpr std::uint16_t kOculusVendorId = 0x2833;
-constexpr std::uint16_t kDk2ProductIds[] = {0x0021, 0x2021};
+// The DK2 tracker. PID 0x2021 on the same vendor id is the USB hub inside
+// the headset: it has no IMU and must never be opened or have its driver
+// replaced, or the tracker behind it disappears.
+constexpr std::uint16_t kDk2TrackerProductId = 0x0021;
 constexpr std::uint8_t kDk2ImuEndpoint = 0x81;
 
 constexpr std::uint64_t kKeepAliveIntervalMs = 3000;
@@ -32,7 +36,7 @@ constexpr std::uint8_t kSetReportRequest = 0x09;
 constexpr std::uint16_t kReportConfig = 0x0302;
 // Feature report 0x08: keep-alive, resets that timer.
 constexpr std::uint16_t kReportKeepAlive = 0x0308;
-// Feature report 0x0C: the DK2's tracking LEDs. The tracker only streams IMU
+// Output report 0x0C: the DK2's tracking LEDs. The tracker only streams IMU
 // data once this has been sent, even though no camera is in use.
 constexpr std::uint16_t kReportLedControl = 0x020C;
 
@@ -46,9 +50,16 @@ std::uint64_t steadyMilliseconds()
 
 bool isDk2Product(const std::uint16_t productId)
 {
-    return std::find(std::begin(kDk2ProductIds), std::end(kDk2ProductIds), productId)
-        != std::end(kDk2ProductIds);
+    return productId == kDk2TrackerProductId;
 }
+
+// Payloads shared by the libusb and hidapi transports. The first byte is the
+// report id, which is also what hidapi expects at the front of the buffer.
+constexpr std::uint8_t kConfigPayload[7] {0x02, 0x00, 0x00, 0x0C, 0x00, 0x10, 0x27};
+constexpr std::uint8_t kLedPayload[17] {
+    0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x5E, 0x01,
+    0x1A, 0x41, 0x00, 0x00, 0x7F, 0x00, 0x00, 0x00, 0x00};
+constexpr std::uint8_t kKeepAlivePayload[5] {0x08, 0x00, 0x00, 0x10, 0x27};
 
 } // namespace
 
@@ -201,17 +212,17 @@ bool Dk2Imu::connectLibusb()
     libusbHandle_ = foundHandle;
     libusbContext_ = context;
     libusbInterface_ = foundInterface;
-    // The DK2 contains a USB hub that shares the Oculus vendor id, so the scan
-    // above usually fails to open one device before it reaches the tracker.
-    // Clear that failure now, or status() would keep reporting it.
     lastError_.clear();
     DriverLog("DK2 IMU: opened over libusb, interface=%d", foundInterface);
 
-    const auto sendFeature = [this](const std::uint16_t report, std::uint8_t* payload,
+    const auto sendFeature = [this](const std::uint16_t report, const std::uint8_t* payload,
                                  const std::uint16_t length, const char* what) {
+        // libusb takes a mutable buffer even for OUT transfers.
+        std::uint8_t buffer[32] {};
+        std::memcpy(buffer, payload, length);
         const int result = libusb_control_transfer(libusbHandle_, kSetReportRequestType,
             kSetReportRequest, report, static_cast<std::uint16_t>(libusbInterface_),
-            payload, length, 1000);
+            buffer, length, 1000);
         if (result < 0) {
             DriverLog("DK2 IMU: %s failed, error=%d (%s)", what, result,
                 libusb_error_name(result));
@@ -220,14 +231,10 @@ bool Dk2Imu::connectLibusb()
     };
 
     // Sample rate / keep-alive configuration.
-    std::uint8_t config[7] {0x02, 0x00, 0x00, 0x0C, 0x00, 0x10, 0x27};
-    sendFeature(kReportConfig, config, sizeof(config), "sensor config");
+    sendFeature(kReportConfig, kConfigPayload, sizeof(kConfigPayload), "sensor config");
 
     // Tracking LEDs. Required before the DK2 streams IMU reports.
-    std::uint8_t enableLeds[17] {
-        0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x5E, 0x01,
-        0x1A, 0x41, 0x00, 0x00, 0x7F, 0x00, 0x00, 0x00, 0x00};
-    sendFeature(kReportLedControl, enableLeds, sizeof(enableLeds), "LED enable");
+    sendFeature(kReportLedControl, kLedPayload, sizeof(kLedPayload), "LED enable");
 
     transport_ = ImuTransport::Libusb;
     connected_ = true;
@@ -237,7 +244,7 @@ bool Dk2Imu::connectLibusb()
 
 bool Dk2Imu::connectHidApi()
 {
-    hid_device_info* devices = hid_enumerate(kOculusVendorId, 0);
+    hid_device_info* devices = hid_enumerate(kOculusVendorId, kDk2TrackerProductId);
     if (devices == nullptr) {
         DriverLog("DK2 IMU: hid_enumerate found no Oculus devices.");
         return false;
@@ -263,6 +270,15 @@ bool Dk2Imu::connectHidApi()
     hidHandle_ = handle;
     // Blocking reads would stall the shutdown path; poll instead.
     hid_set_nonblocking(hidHandle_, 1);
+
+    // Same start-up reports as the libusb path; without them the tracker
+    // never starts streaming.
+    if (hid_send_feature_report(hidHandle_, kConfigPayload, sizeof(kConfigPayload)) < 0) {
+        DriverLog("DK2 IMU: sensor config failed over hidapi.");
+    }
+    if (hid_write(hidHandle_, kLedPayload, sizeof(kLedPayload)) < 0) {
+        DriverLog("DK2 IMU: LED enable failed over hidapi.");
+    }
     lastError_.clear();
     DriverLog("DK2 IMU: opened over hidapi.");
     transport_ = ImuTransport::HidApi;
@@ -402,7 +418,8 @@ void Dk2Imu::readerLoop()
         if (libusbHandle_ != nullptr) {
             const std::uint64_t nowMs = steadyMilliseconds();
             if (lastKeepAliveMs == 0 || (nowMs - lastKeepAliveMs) >= kKeepAliveIntervalMs) {
-                std::uint8_t keepAlive[5] {0x08, 0x00, 0x00, 0x10, 0x27};
+                std::uint8_t keepAlive[sizeof(kKeepAlivePayload)] {};
+                std::memcpy(keepAlive, kKeepAlivePayload, sizeof(keepAlive));
                 const int result = libusb_control_transfer(libusbHandle_,
                     kSetReportRequestType, kSetReportRequest, kReportKeepAlive,
                     static_cast<std::uint16_t>(libusbInterface_),
@@ -427,6 +444,15 @@ void Dk2Imu::readerLoop()
                 break;
             }
         } else if (hidHandle_ != nullptr) {
+            const std::uint64_t nowMs = steadyMilliseconds();
+            if (lastKeepAliveMs == 0 || (nowMs - lastKeepAliveMs) >= kKeepAliveIntervalMs) {
+                if (hid_send_feature_report(hidHandle_, kKeepAlivePayload,
+                        sizeof(kKeepAlivePayload)) < 0) {
+                    DriverLog("DK2 IMU: keep-alive failed over hidapi.");
+                }
+                lastKeepAliveMs = nowMs;
+            }
+
             const int bytesRead = hid_read_timeout(hidHandle_, buffer,
                 sizeof(buffer), 100);
             if (bytesRead > 0) {

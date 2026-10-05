@@ -12,8 +12,7 @@
 
 #include <Windows.h>
 #include <setupapi.h>
-#include <winusb.h>
-#include <usbiodef.h>
+#include <cfgmgr32.h>
 #include <libusb.h>
 #include <hidapi.h>
 
@@ -21,6 +20,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -32,12 +32,10 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// {A5DCBF10-6530-11D2-901F-00C04FB951ED} is GUID_DEVINTERFACE_USB_DEVICE.
-const GUID kUsbDeviceInterfaceGuid = {
-    0xA5DCBF10, 0x6530, 0x11D2, {0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED}};
-
 constexpr std::uint16_t kOculusVendorId = 0x2833;
-constexpr std::uint16_t kDk2ProductIds[] = {0x0021, 0x2021};
+// The DK2 tracker. PID 0x2021 on the same vendor id is the USB hub inside the
+// headset: matching it would report a DK2 whose tracker is missing.
+constexpr std::uint16_t kDk2TrackerProductId = 0x0021;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -217,76 +215,47 @@ DriverFiles findDriverFiles()
 // DK2 USB / WinUSB detection
 // ---------------------------------------------------------------------------
 
-// Returns true if a DK2 tracking device (VID 2833, PID 0021/2021) is present
-// and bound to WinUSB.
-bool isDk2WinUsbBound()
+// Returns the Windows service bound to the DK2 tracker ("WinUSB", "HidUsb",
+// ...), or an empty string if it is not plugged in. Read from the device's
+// registry properties, so it works whatever driver is installed. (Zadig's
+// WinUSB package does not register GUID_DEVINTERFACE_USB_DEVICE, so probing
+// that interface class never finds the tracker.)
+std::string trackerDriverService()
 {
-    HDEVINFO deviceInfoSet = SetupDiGetClassDevs(
-        &kUsbDeviceInterfaceGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    HDEVINFO deviceInfoSet = SetupDiGetClassDevsW(nullptr, L"USB", nullptr,
+        DIGCF_ALLCLASSES | DIGCF_PRESENT);
     if (deviceInfoSet == INVALID_HANDLE_VALUE) {
-        return false;
+        return {};
     }
 
-    SP_DEVICE_INTERFACE_DATA interfaceData {};
-    interfaceData.cbSize = sizeof(interfaceData);
-
-    bool found = false;
-    for (int deviceIndex = 0;
-         SetupDiEnumDeviceInterfaces(deviceInfoSet, nullptr, &kUsbDeviceInterfaceGuid,
-             deviceIndex, &interfaceData);
-         ++deviceIndex) {
-        DWORD requiredSize = 0;
-        if (!SetupDiGetDeviceInterfaceDetailW(deviceInfoSet, &interfaceData, nullptr, 0,
-                &requiredSize, nullptr)
-            || requiredSize == 0) {
+    std::string service;
+    SP_DEVINFO_DATA deviceInfo {};
+    deviceInfo.cbSize = sizeof(deviceInfo);
+    for (DWORD index = 0; SetupDiEnumDeviceInfo(deviceInfoSet, index, &deviceInfo); ++index) {
+        wchar_t instanceId[MAX_DEVICE_ID_LEN] {};
+        if (!SetupDiGetDeviceInstanceIdW(deviceInfoSet, &deviceInfo, instanceId,
+                MAX_DEVICE_ID_LEN, nullptr)) {
             continue;
         }
-
-        std::vector<std::uint8_t> buffer(requiredSize, 0);
-        auto* detailData = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(buffer.data());
-        detailData->cbSize = sizeof(*detailData);
-        if (!SetupDiGetDeviceInterfaceDetailW(deviceInfoSet, &interfaceData, detailData,
-                requiredSize, nullptr, nullptr)) {
+        std::wstring id(instanceId);
+        std::transform(id.begin(), id.end(), id.begin(),
+            [](const wchar_t c) { return static_cast<wchar_t>(std::towupper(c)); });
+        if (id.find(L"USB\\VID_2833&PID_0021\\") != 0) {
             continue;
         }
-
-        HANDLE deviceHandle = CreateFileW(detailData->DevicePath,
-            GENERIC_WRITE | GENERIC_READ,
-            FILE_SHARE_WRITE | FILE_SHARE_READ,
-            nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
-        if (deviceHandle == INVALID_HANDLE_VALUE) {
-            continue;
+        wchar_t value[256] {};
+        if (SetupDiGetDeviceRegistryPropertyW(deviceInfoSet, &deviceInfo, SPDRP_SERVICE,
+                nullptr, reinterpret_cast<PBYTE>(value), sizeof(value) - sizeof(wchar_t),
+                nullptr)) {
+            service = wideToUtf8(value);
+        } else {
+            service = "(surucu yok)";
         }
-
-        WINUSB_INTERFACE_HANDLE winUsbHandle = nullptr;
-        if (!WinUsb_Initialize(deviceHandle, &winUsbHandle)) {
-            CloseHandle(deviceHandle);
-            continue;
-        }
-
-        USB_DEVICE_DESCRIPTOR descriptor {};
-        unsigned long lengthTransferred = 0;
-        const bool descriptorOk = WinUsb_GetDescriptor(winUsbHandle,
-            USB_DEVICE_DESCRIPTOR_TYPE, 0, 0,
-            reinterpret_cast<unsigned char*>(&descriptor), sizeof(descriptor),
-            &lengthTransferred);
-        if (descriptorOk && descriptor.idVendor == kOculusVendorId) {
-            const bool productMatch = std::find(std::begin(kDk2ProductIds),
-                std::end(kDk2ProductIds), descriptor.idProduct) != std::end(kDk2ProductIds);
-            if (productMatch) {
-                found = true;
-            }
-        }
-
-        WinUsb_Free(winUsbHandle);
-        CloseHandle(deviceHandle);
-        if (found) {
-            break;
-        }
+        break;
     }
 
     SetupDiDestroyDeviceInfoList(deviceInfoSet);
-    return found;
+    return service;
 }
 
 // Returns true if a DK2 tracking device is present at all (regardless of
@@ -314,9 +283,7 @@ bool isDk2Present()
         if (descriptor.idVendor != kOculusVendorId) {
             continue;
         }
-        const bool productMatch = std::find(std::begin(kDk2ProductIds),
-            std::end(kDk2ProductIds), descriptor.idProduct) != std::end(kDk2ProductIds);
-        if (productMatch) {
+        if (descriptor.idProduct == kDk2TrackerProductId) {
             found = true;
             break;
         }
@@ -361,9 +328,7 @@ bool testImuConnection(std::string& detail)
         if (descriptor.idVendor != kOculusVendorId) {
             continue;
         }
-        const bool productMatch = std::find(std::begin(kDk2ProductIds),
-            std::end(kDk2ProductIds), descriptor.idProduct) != std::end(kDk2ProductIds);
-        if (!productMatch) {
+        if (descriptor.idProduct != kDk2TrackerProductId) {
             continue;
         }
 
@@ -608,16 +573,23 @@ int runInstaller()
         recordTest("IMU baglantisi (rotasyon takibi)", imuOk, detail);
     }
 
-    // Test: DK2 bound to a usable driver. The driver works with either WinUSB
-    // or libusb-win32, so this passes if WinUSB is bound OR the IMU test
-    // succeeded (which proves a working driver is present).
+    // Test: the tracker is on a driver the IMU code can use. WinUSB is the
+    // supported setup; anything else passes only if the IMU test above
+    // actually got data through it.
     {
-        const bool bound = isDk2WinUsbBound();
-        const bool usable = bound || imuOk;
-        recordTest("DK2 surucu baglantisi (WinUSB/libusb)", usable,
-            bound ? "WinUSB baglantisi aktif"
-                  : (imuOk ? "libusb-win32 uzerinden erisilebilir (WinUSB gerekmez)"
-                           : "WinUSB/libusb surucusu gerekli"));
+        const std::string service = trackerDriverService();
+        const bool winUsb = _stricmp(service.c_str(), "WinUSB") == 0;
+        std::string detail;
+        if (service.empty()) {
+            detail = "DK2 izleme cihazi (PID 0021) bulunamadi";
+        } else if (winUsb) {
+            detail = "WinUSB bagli";
+        } else {
+            detail = "Surucu: " + service
+                + (imuOk ? " (IMU yine de erisilebilir)"
+                         : " - Zadig ile izleme cihazina (PID 0021) WinUSB kurun");
+        }
+        recordTest("DK2 surucu baglantisi (WinUSB)", winUsb || imuOk, detail);
     }
 
     // Test: the DK2 panel is attached as an extended display. Without this

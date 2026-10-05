@@ -245,11 +245,12 @@ Logda `entering standby` / `leaving standby` satırları birkaç saniyede bir te
 
 ### "Tracker not connected" / baş hareketi çalışmıyor
 
-DK2'nin USB izleme cihazının **WinUSB** veya **libusb-win32** sürücüsüne bağlı olması gerekir. Windows'un varsayılan HID sürücüsü bu cihazı açtırmaz.
+DK2'nin USB izleme cihazının (PID `0021`) **WinUSB** sürücüsüne bağlı olması gerekir. Windows'un varsayılan HID sürücüsü bu cihazı açtırmaz.
 
 1. [Zadig](https://zadig.akeo.ie/) indirin ve çalıştırın.
 2. *Options → List All Devices* işaretleyin.
-3. Listeden DK2 izleme cihazını seçin (VID `2833`, PID `0021` veya `2021`).
+3. Listeden **Rift DK2** izleme cihazını seçin ve USB ID'nin `2833 0021` olduğunu doğrulayın.
+   > **Uyarı:** `2833 2021` DK2'nin içindeki USB hub'dır. Onun sürücüsünü değiştirmeyin; değiştirirseniz arkasındaki izleme cihazı kaybolur.
 4. Hedef sürücü olarak **WinUSB** seçip *Replace Driver*'a basın.
 5. SteamVR'ı yeniden başlatın.
 
